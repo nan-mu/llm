@@ -1,0 +1,4 @@
+*.sock
+store/**
+!store/
+!store/.gitkeep
