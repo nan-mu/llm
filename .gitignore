@@ -2,3 +2,7 @@
 encore.gen.go
 encore.gen.cue
 /encore.gen
+/models
+*.sock
+.secrets.local.cue
+unix/mlx_lm/.pixi/envs/
