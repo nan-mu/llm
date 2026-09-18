@@ -46,6 +46,7 @@ func initService() (*Service, error) {
 	s := &Service{runtimes: rts}
 	runCtx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
+	s.wireWorkerExitHandlers()
 	if err := resetObserved(context.Background()); err != nil {
 		cancel()
 		return nil, err
@@ -116,6 +117,41 @@ func (s *Service) drainFrontends(ctx context.Context) {
 		}
 		_ = clearFrontendRuntime(ctx, kind)
 		_ = setFrontendObserved(ctx, kind, modelstate.FrontendStopped, "")
+	}
+}
+
+// wireWorkerExitHandlers registers immediate reload on unexpected worker death
+// (does not wait for the 10s memory sampler). Intentional Unload does not fire.
+func (s *Service) wireWorkerExitHandlers() {
+	type exitAware interface {
+		SetWorkerExitHandler(fn func(id string))
+	}
+	for _, kind := range modelstate.AllFrontends() {
+		rt := s.runtime(kind)
+		aware, ok := rt.(exitAware)
+		if !ok {
+			continue
+		}
+		k := kind
+		aware.SetWorkerExitHandler(func(id string) {
+			rlog.Warn("worker exit notified",
+				"event", "control.worker_exit_notified",
+				"frontend", string(k),
+				"model_id", id,
+			)
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), loadTimeout+time.Minute)
+				defer cancel()
+				if err := s.handleLostWorkers(ctx, k); err != nil {
+					rlog.Error("handle lost workers after exit failed",
+						"event", "control.worker_exit_recover_failed",
+						"frontend", string(k),
+						"model_id", id,
+						"err", err,
+					)
+				}
+			}()
+		})
 	}
 }
 

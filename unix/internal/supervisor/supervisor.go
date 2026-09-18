@@ -40,12 +40,17 @@ type entry struct {
 	sock   string
 }
 
+// ExitHandler is called when a worker exits unexpectedly (not via Unload).
+// id is the model id that was being served.
+type ExitHandler func(id string)
+
 // Supervisor is an in-memory table of per-model child processes.
 type Supervisor struct {
-	kind  string
-	mu    sync.Mutex
-	ready bool
-	byID  map[string]*entry
+	kind        string
+	mu          sync.Mutex
+	ready       bool
+	byID        map[string]*entry
+	exitHandler ExitHandler
 }
 
 // New returns a supervisor that has not been Start'ed yet.
@@ -72,15 +77,20 @@ func (s *Supervisor) Start(ctx context.Context) error {
 // Stop kills every child and clears ready.
 func (s *Supervisor) Stop(ctx context.Context) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	var first error
+	entries := make(map[string]*entry, len(s.byID))
 	for id, e := range s.byID {
-		if err := e.proc.Stop(ctx); err != nil && first == nil {
-			first = err
-		}
+		entries[id] = e
 		delete(s.byID, id)
 	}
 	s.ready = false
+	s.mu.Unlock()
+
+	var first error
+	for _, e := range entries {
+		if err := e.proc.Stop(ctx); err != nil && first == nil {
+			first = err
+		}
+	}
 	if first != nil {
 		return unix.WrapUnavailable("stop frontend", first)
 	}
@@ -96,6 +106,14 @@ func (s *Supervisor) Ready(ctx context.Context) error {
 		return unix.ErrNotReady
 	}
 	return nil
+}
+
+// SetExitHandler registers a callback for unexpected worker death.
+// Unload deletes the entry before Stop, so intentional stops do not fire it.
+func (s *Supervisor) SetExitHandler(fn ExitHandler) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.exitHandler = fn
 }
 
 // Load spawns a worker for id (or returns if already healthy).
@@ -145,12 +163,43 @@ func (s *Supervisor) Load(ctx context.Context, id string, spec SpawnSpec) error 
 	s.byID[id] = &entry{proc: p, client: client, path: spec.Path, sock: spec.SocketPath}
 	s.mu.Unlock()
 
+	s.watchExit(id, p)
+
 	logx.Info("frontend model loaded",
 		"event", "frontend.model_loaded",
 		"kind", s.kind,
 		"model_id", id,
 	)
 	return nil
+}
+
+// watchExit fires exitHandler once if the process dies while still registered.
+func (s *Supervisor) watchExit(id string, p *proc.Proc) {
+	done := p.Done()
+	if done == nil {
+		return
+	}
+	go func() {
+		<-done
+		s.mu.Lock()
+		e, ok := s.byID[id]
+		if !ok || e.proc != p {
+			s.mu.Unlock()
+			return
+		}
+		delete(s.byID, id)
+		handler := s.exitHandler
+		s.mu.Unlock()
+
+		logx.Warn("frontend worker exited",
+			"event", "frontend.worker_exited",
+			"kind", s.kind,
+			"model_id", id,
+		)
+		if handler != nil {
+			handler(id)
+		}
+	}()
 }
 
 // Unload stops the worker for id.
@@ -229,17 +278,32 @@ func (s *Supervisor) PID(id string) (int, bool) {
 	return pid, true
 }
 
-// PIDs returns all live worker pids.
+// PIDs returns all live worker pids (skips dead children).
 func (s *Supervisor) PIDs() []int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]int, 0, len(s.byID))
-	for _, e := range s.byID {
+	for id, e := range s.byID {
+		if !e.proc.Alive() {
+			delete(s.byID, id)
+			continue
+		}
 		if pid := e.proc.PID(); pid > 0 {
 			out = append(out, pid)
 		}
 	}
 	return out
+}
+
+// Socket returns the Unix socket path for a loaded model id.
+func (s *Supervisor) Socket(id string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.byID[id]
+	if !ok || e.sock == "" {
+		return "", false
+	}
+	return e.sock, true
 }
 
 func (e *entry) toModel(id string) unix.Model {

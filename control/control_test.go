@@ -152,6 +152,58 @@ func TestHealthDoesNotWaitForReconcile(t *testing.T) {
 	}
 }
 
+func TestRouteEnablementOnLoadUnload(t *testing.T) {
+	env := newTestEnv(t)
+	ctx := env.ctx(t)
+	setDesired(t, ctx)
+	if err := env.svc.reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	chat, err := isRouteEnabled(ctx, "POST /v1/chat/completions")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if chat {
+		t.Fatal("chat route should be disabled with no loaded translation model")
+	}
+	asr, err := isRouteEnabled(ctx, "POST /v1/audio/transcriptions")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if asr {
+		t.Fatal("asr route should be disabled")
+	}
+
+	if _, err := env.svc.loadModel(ctx, idGemma); err != nil {
+		t.Fatal(err)
+	}
+	chat, err = isRouteEnabled(ctx, "POST /v1/chat/completions")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !chat {
+		t.Fatal("chat route should be enabled after loading Gemma")
+	}
+	asr, err = isRouteEnabled(ctx, "POST /v1/audio/transcriptions")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if asr {
+		t.Fatal("asr route should stay disabled")
+	}
+
+	if _, err := env.svc.unloadModel(ctx, idGemma); err != nil {
+		t.Fatal(err)
+	}
+	chat, err = isRouteEnabled(ctx, "POST /v1/chat/completions")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if chat {
+		t.Fatal("chat route should disable after unload")
+	}
+}
+
 func TestReconcileNoDesiredLoadedStartsNothing(t *testing.T) {
 	env := newTestEnv(t)
 	ctx := env.ctx(t)

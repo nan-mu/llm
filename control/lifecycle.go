@@ -69,6 +69,10 @@ func (s *Service) reconcile(ctx context.Context) error {
 			}
 		}
 	}
+	if err := refreshRouteEnablement(ctx); err != nil {
+		recordEvent(ctx, "", eventReconcileFailed, map[string]string{"error": err.Error()})
+		return fmt.Errorf("reconcile route enablement: %w", err)
+	}
 	recordEvent(ctx, "", eventReconcileDone, nil)
 	return nil
 }
@@ -108,6 +112,7 @@ func (s *Service) applyLoadLocked(ctx context.Context, row modelRow) (*Snapshot,
 						_ = refreshFrontendPIDs(ctx, row.Frontend)
 					}
 				}
+				_ = refreshRouteEnablement(ctx)
 				return row.snapshot(), nil
 			}
 		}
@@ -158,6 +163,7 @@ func (s *Service) applyLoadLocked(ctx context.Context, row modelRow) (*Snapshot,
 	recordEvent(ctx, row.ID, eventLoaded, map[string]string{"native_id": row.NativeID})
 	row.Observed = modelstate.ModelLoaded
 	row.LastError = ""
+	_ = refreshRouteEnablement(ctx)
 	return row.snapshot(), nil
 }
 
@@ -229,6 +235,7 @@ func (s *Service) unloadLocked(ctx context.Context, id string, stopIfIdle bool) 
 			)
 		}
 	}
+	_ = refreshRouteEnablement(ctx)
 	return row.snapshot(), nil
 }
 

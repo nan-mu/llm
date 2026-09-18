@@ -4,7 +4,6 @@ package mlxlm
 
 import (
 	"context"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -129,12 +128,9 @@ func (r *Runtime) BackendPIDs(ctx context.Context) ([]int, error) {
 	return r.sup.PIDs(), nil
 }
 
-func (r *Runtime) ChatCompletions(context.Context, http.ResponseWriter, *http.Request) error {
-	return unix.ErrNotImplemented
-}
-
-func (r *Runtime) Transcribe(context.Context, http.ResponseWriter, *http.Request) error {
-	return unix.ErrNotImplemented
+// SetWorkerExitHandler registers a callback for unexpected worker process death.
+func (r *Runtime) SetWorkerExitHandler(fn func(id string)) {
+	r.sup.SetExitHandler(fn)
 }
 
 func applyDefaults(cfg Config) (Config, error) {

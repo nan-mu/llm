@@ -3,6 +3,8 @@ package mlxlm
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -91,10 +93,52 @@ func TestEnsureLoaded(t *testing.T) {
 	}
 }
 
-func TestInferencerUnimplemented(t *testing.T) {
+func TestTranscribeUnimplemented(t *testing.T) {
 	rt := newTestRuntime(t)
-	if err := rt.ChatCompletions(context.Background(), nil, nil); !errors.Is(err, unix.ErrNotImplemented) {
-		t.Fatalf("ChatCompletions: %v", err)
+	if err := rt.Transcribe(context.Background(), nil, nil); !errors.Is(err, unix.ErrNotImplemented) {
+		t.Fatalf("Transcribe: %v", err)
+	}
+}
+
+func TestChatCompletionsProxy(t *testing.T) {
+	rt := newTestRuntime(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := rt.EnsureLoaded(ctx, "chatm"); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"model":"chatm","messages":[{"role":"user","content":"hi"}]}`
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	if err := rt.ChatCompletions(ctx, rr, req); err != nil {
+		t.Fatal(err)
+	}
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "fakemlx-ok") {
+		t.Fatalf("body = %s", rr.Body.String())
+	}
+
+	proxy, err := NewChatProxyWithConfig(Config{Cwd: rt.cfg.Cwd, APIKey: rt.cfg.APIKey, ModelsDir: rt.cfg.ModelsDir, Bin: rt.cfg.Bin})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req2, err := http.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req2.Header.Set("Content-Type", "application/json")
+	rr2 := httptest.NewRecorder()
+	if err := proxy.ChatCompletions(ctx, rr2, req2); err != nil {
+		t.Fatal(err)
+	}
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("proxy status = %d body=%s", rr2.Code, rr2.Body.String())
 	}
 }
 

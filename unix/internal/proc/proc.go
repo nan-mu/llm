@@ -333,6 +333,13 @@ func (p *Proc) removeSocket() {
 	}
 }
 
+// Done returns a channel closed when the child exits. Nil if not started.
+func (p *Proc) Done() <-chan struct{} {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.done
+}
+
 // Alive reports whether the child is still running.
 func (p *Proc) Alive() bool {
 	p.mu.Lock()

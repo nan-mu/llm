@@ -2,6 +2,7 @@ package control
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"encore.app/internal/modelstate"
@@ -113,6 +114,57 @@ func TestSampleFrontendWritesMemory(t *testing.T) {
 	}
 	if be.MemoryMB == nil || *be.MemoryMB != 4242 {
 		t.Fatalf("memory_mb = %v", be.MemoryMB)
+	}
+}
+
+func TestSampleRecoversLostWorker(t *testing.T) {
+	env := newTestEnv(t)
+	ctx := env.ctx(t)
+	setDesired(t, ctx)
+	if _, err := env.svc.loadModel(ctx, idGemma); err != nil {
+		t.Fatal(err)
+	}
+	rt := env.svc.runtime(modelstate.FrontendMlxlm)
+	if err := rt.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Supervisor ready again with zero workers (crash leaving catalog stale).
+	if err := rt.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	old := memoryMBFn
+	memoryMBFn = func(pids []int64) (int64, error) {
+		t.Fatal("should not footprint when runtime reports no live pids")
+		return 0, nil
+	}
+	t.Cleanup(func() { memoryMBFn = old })
+
+	if err := env.svc.sampleFrontend(ctx, modelstate.FrontendMlxlm); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := env.svc.lookupSnapshot(ctx, idGemma)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Observed != string(modelstate.ModelLoaded) {
+		t.Fatalf("after recover observed=%s", snap.Observed)
+	}
+	if snap.PID == nil || *snap.PID <= 0 {
+		t.Fatalf("expected new pid after recover")
+	}
+	chat, err := isRouteEnabled(ctx, "POST /v1/chat/completions")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !chat {
+		t.Fatal("chat route should be enabled after recover")
+	}
+}
+
+func TestPIDGoneErr(t *testing.T) {
+	err := fmt.Errorf("footprint 8852: exit status 66 (footprint: Unable to find pid for process matching '8852')")
+	if !isPIDGoneErr(err) {
+		t.Fatal("expected pid-gone detection")
 	}
 }
 

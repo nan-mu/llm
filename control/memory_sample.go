@@ -55,22 +55,103 @@ func (s *Service) sampleAllFrontends(ctx context.Context) {
 }
 
 func (s *Service) sampleFrontend(ctx context.Context, kind modelstate.FrontendKind) error {
-	pids := s.liveFrontendPIDs(ctx, kind)
+	pids, fromRuntime := s.liveFrontendPIDs(ctx, kind)
+	if fromRuntime && len(pids) == 0 {
+		// Supervisor is up but no live workers — catalog must not keep stale PIDs
+		// or observed=loaded (gateway would serve model_not_loaded while routes stay on).
+		return s.handleLostWorkers(ctx, kind)
+	}
 	if len(pids) == 0 {
+		_ = refreshFrontendPIDsFromList(ctx, kind, nil)
 		return setFrontendMemoryMB(ctx, kind, nil)
 	}
-	// Keep catalog pids in sync with the live worker (socket holder), not a wrapper.
+
 	_ = refreshFrontendPIDsFromList(ctx, kind, pids)
 	_ = s.syncModelPIDs(ctx, kind)
 
 	mb, err := memoryMBFn(pids)
 	if err != nil {
+		if isPIDGoneErr(err) {
+			rlog.Warn("memory sample pids gone; treating as worker loss",
+				"event", "control.memory_pids_gone",
+				"frontend", string(kind),
+				"err", err,
+			)
+			return s.handleLostWorkers(ctx, kind)
+		}
 		return err
 	}
 	if err := setFrontendMemoryMB(ctx, kind, &mb); err != nil {
 		return err
 	}
 	return insertMemorySample(ctx, kind, mb, memorySampleKeep)
+}
+
+// handleLostWorkers marks previously-loaded models on kind as failed, clears PIDs,
+// refreshes api_routes, and reloads any that are still desired=loaded.
+func (s *Service) handleLostWorkers(ctx context.Context, kind modelstate.FrontendKind) error {
+	_ = refreshFrontendPIDsFromList(ctx, kind, nil)
+	_ = setFrontendMemoryMB(ctx, kind, nil)
+
+	rt := s.runtime(kind)
+	if rt != nil && rt.Ready(ctx) == nil {
+		if models, err := rt.List(ctx); err == nil {
+			for _, m := range models {
+				if m.State == modelstate.ModelFailed || m.State == modelstate.ModelLoaded {
+					// Unload cleans dead entries / leftover socks; ignore not-found.
+					_ = rt.Unload(ctx, m.ID)
+				}
+			}
+		}
+	}
+
+	rows, err := listModels(ctx)
+	if err != nil {
+		return err
+	}
+	var reload []string
+	lost := false
+	for _, row := range rows {
+		if row.Frontend != kind {
+			continue
+		}
+		switch row.Observed {
+		case modelstate.ModelLoaded, modelstate.ModelLoading, modelstate.ModelUnloading:
+			lost = true
+			_ = setModelObserved(ctx, row.ID, modelstate.ModelFailed, "worker process gone")
+			_ = setModelPID(ctx, row.ID, nil)
+			if row.Desired == modelstate.ModelLoaded {
+				reload = append(reload, row.ID)
+			}
+			rlog.Warn("model worker lost",
+				"event", "control.model_worker_lost",
+				"model_id", row.ID,
+				"frontend", string(kind),
+			)
+		}
+	}
+	if lost {
+		_ = setFrontendObserved(ctx, kind, modelstate.FrontendFailed, "worker process gone")
+		_ = refreshRouteEnablement(ctx)
+	} else {
+		// Still clear stale frontend pids / memory even if catalog already failed.
+		_ = refreshRouteEnablement(ctx)
+	}
+
+	for _, id := range reload {
+		rlog.Info("reloading model after worker loss",
+			"event", "control.model_reload_after_loss",
+			"model_id", id,
+		)
+		if _, err := s.loadModel(ctx, id); err != nil {
+			rlog.Error("reload after worker loss failed",
+				"event", "control.model_reload_after_loss_failed",
+				"model_id", id,
+				"err", err,
+			)
+		}
+	}
+	return nil
 }
 
 func (s *Service) syncModelPIDs(ctx context.Context, kind modelstate.FrontendKind) error {
@@ -98,26 +179,27 @@ func (s *Service) syncModelPIDs(ctx context.Context, kind modelstate.FrontendKin
 	return nil
 }
 
-func (s *Service) liveFrontendPIDs(ctx context.Context, kind modelstate.FrontendKind) []int64 {
+// liveFrontendPIDs returns worker pids. If the runtime is Ready, the live list is
+// authoritative even when empty (do not fall back to stale catalog pids).
+func (s *Service) liveFrontendPIDs(ctx context.Context, kind modelstate.FrontendKind) (pids []int64, fromRuntime bool) {
 	rt := s.runtime(kind)
 	if rt != nil && rt.Ready(ctx) == nil {
-		if live, err := rt.BackendPIDs(ctx); err == nil && len(live) > 0 {
+		live, err := rt.BackendPIDs(ctx)
+		if err == nil {
 			out := make([]int64, 0, len(live))
 			for _, p := range live {
 				if p > 1 {
 					out = append(out, int64(p))
 				}
 			}
-			if len(out) > 0 {
-				return out
-			}
+			return out, true
 		}
 	}
 	row, err := getFrontend(ctx, kind)
 	if err != nil {
-		return nil
+		return nil, false
 	}
-	return row.PIDs
+	return row.PIDs, false
 }
 
 func refreshFrontendPIDsFromList(ctx context.Context, kind modelstate.FrontendKind, pids []int64) error {
@@ -127,6 +209,16 @@ func refreshFrontendPIDsFromList(ctx context.Context, kind modelstate.FrontendKi
 		WHERE kind = $1
 	`, kind, formatInt64Array(pids))
 	return err
+}
+
+func isPIDGoneErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "Unable to find pid") ||
+		strings.Contains(msg, "exit status 66") ||
+		strings.Contains(msg, "No such process")
 }
 
 func sumProcessMemoryMB(pids []int64) (int64, error) {
@@ -144,16 +236,23 @@ func sumFootprintMB(pids []int64) (int64, error) {
 	var total int64
 	var lastErr error
 	any := false
+	gone := 0
 	for _, pid := range pids {
 		mb, err := footprintMB(pid)
 		if err != nil {
 			lastErr = err
+			if isPIDGoneErr(err) {
+				gone++
+			}
 			continue
 		}
 		total += mb
 		any = true
 	}
 	if !any {
+		if gone == len(pids) && lastErr != nil {
+			return 0, lastErr
+		}
 		if lastErr != nil {
 			return 0, lastErr
 		}

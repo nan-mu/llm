@@ -15,6 +15,13 @@ func Info(msg string, keysAndValues ...any) {
 	rlog.Info(msg, keysAndValues...)
 }
 
+// Warn writes to stderr always, and to Encore rlog when the runtime is present.
+func Warn(msg string, keysAndValues ...any) {
+	log.Print(format(msg, keysAndValues...))
+	defer func() { _ = recover() }()
+	rlog.Warn(msg, keysAndValues...)
+}
+
 func format(msg string, keysAndValues ...any) string {
 	if len(keysAndValues) == 0 {
 		return msg

@@ -34,7 +34,7 @@ type Runtime interface {
 	BackendPIDs(ctx context.Context) ([]int, error)
 }
 
-// Inferencer is the gateway-plane surface. This slice does not implement it.
+// Inferencer is the gateway-plane surface (chat/transcribe proxy).
 type Inferencer interface {
 	ChatCompletions(ctx context.Context, w http.ResponseWriter, req *http.Request) error
 	Transcribe(ctx context.Context, w http.ResponseWriter, req *http.Request) error

@@ -94,7 +94,7 @@ func TestLoadTwoUnloadOne(t *testing.T) {
 	}
 }
 
-func TestDeadChildMarkedFailed(t *testing.T) {
+func TestExitHandlerOnKill(t *testing.T) {
 	bin, err := fakemlx.Build()
 	if err != nil {
 		t.Fatal(err)
@@ -108,6 +108,9 @@ func TestDeadChildMarkedFailed(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = sup.Stop(context.Background()) })
+
+	notified := make(chan string, 1)
+	sup.SetExitHandler(func(id string) { notified <- id })
 
 	sock := filepath.Join(cwd, "x.sock")
 	if err := sup.Load(ctx, "x", spawn(bin, cwd, sock, "/models/x")); err != nil {
@@ -127,18 +130,50 @@ func TestDeadChildMarkedFailed(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = proc.Kill()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		got, err := sup.Get(ctx, "x")
-		if err != nil {
-			t.Fatal(err)
+
+	select {
+	case id := <-notified:
+		if id != "x" {
+			t.Fatalf("exit id = %q", id)
 		}
-		if got.State == modelstate.ModelFailed {
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected exit handler")
 	}
-	t.Fatal("expected failed state after kill")
+
+	if _, err := sup.Get(ctx, "x"); !unix.Is(err, unix.CodeNotFound) {
+		t.Fatalf("after crash Get err=%v, want not found", err)
+	}
+}
+
+func TestUnloadDoesNotFireExitHandler(t *testing.T) {
+	bin, err := fakemlx.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cwd := shortTemp(t)
+	sup := supervisor.New("mlxlm")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := sup.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sup.Stop(context.Background()) })
+
+	notified := make(chan string, 1)
+	sup.SetExitHandler(func(id string) { notified <- id })
+
+	sock := filepath.Join(cwd, "y.sock")
+	if err := sup.Load(ctx, "y", spawn(bin, cwd, sock, "/models/y")); err != nil {
+		t.Fatal(err)
+	}
+	if err := sup.Unload(ctx, "y"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case id := <-notified:
+		t.Fatalf("Unload must not notify exit handler, got %q", id)
+	case <-time.After(300 * time.Millisecond):
+	}
 }
 
 func TestIdempotentLoad(t *testing.T) {
