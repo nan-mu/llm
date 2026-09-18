@@ -109,8 +109,16 @@ func TestExitHandlerOnKill(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = sup.Stop(context.Background()) })
 
-	notified := make(chan string, 1)
-	sup.SetExitHandler(func(id string) { notified <- id })
+	notified := make(chan struct {
+		id       string
+		exitCode int
+	}, 1)
+	sup.SetExitHandler(func(id string, exitCode int) {
+		notified <- struct {
+			id       string
+			exitCode int
+		}{id, exitCode}
+	})
 
 	sock := filepath.Join(cwd, "x.sock")
 	if err := sup.Load(ctx, "x", spawn(bin, cwd, sock, "/models/x")); err != nil {
@@ -132,9 +140,9 @@ func TestExitHandlerOnKill(t *testing.T) {
 	_ = proc.Kill()
 
 	select {
-	case id := <-notified:
-		if id != "x" {
-			t.Fatalf("exit id = %q", id)
+	case got := <-notified:
+		if got.id != "x" {
+			t.Fatalf("exit id = %q", got.id)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("expected exit handler")
@@ -160,7 +168,7 @@ func TestUnloadDoesNotFireExitHandler(t *testing.T) {
 	t.Cleanup(func() { _ = sup.Stop(context.Background()) })
 
 	notified := make(chan string, 1)
-	sup.SetExitHandler(func(id string) { notified <- id })
+	sup.SetExitHandler(func(id string, _ int) { notified <- id })
 
 	sock := filepath.Join(cwd, "y.sock")
 	if err := sup.Load(ctx, "y", spawn(bin, cwd, sock, "/models/y")); err != nil {

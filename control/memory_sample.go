@@ -88,7 +88,7 @@ func (s *Service) sampleFrontend(ctx context.Context, kind modelstate.FrontendKi
 }
 
 // handleLostWorkers marks previously-loaded models on kind as failed, clears PIDs,
-// refreshes api_routes, and reloads any that are still desired=loaded.
+// refreshes api_routes, and schedules restarts for desired=loaded via RestartController.
 func (s *Service) handleLostWorkers(ctx context.Context, kind modelstate.FrontendKind) error {
 	_ = refreshFrontendPIDsFromList(ctx, kind, nil)
 	_ = setFrontendMemoryMB(ctx, kind, nil)
@@ -139,17 +139,42 @@ func (s *Service) handleLostWorkers(ctx context.Context, kind modelstate.Fronten
 	}
 
 	for _, id := range reload {
-		rlog.Info("reloading model after worker loss",
-			"event", "control.model_reload_after_loss",
-			"model_id", id,
-		)
-		if _, err := s.loadModel(ctx, id); err != nil {
-			rlog.Error("reload after worker loss failed",
-				"event", "control.model_reload_after_loss_failed",
-				"model_id", id,
-				"err", err,
-			)
+		if s.restarts != nil {
+			s.restarts.onUnexpectedExit(ctx, id, unknownExitCode)
 		}
+	}
+	return nil
+}
+
+// handleLostModel recovers a single worker identified by catalog id or native_id.
+func (s *Service) handleLostModel(ctx context.Context, kind modelstate.FrontendKind, ref string, exitCode int) error {
+	row, err := getModelByFrontendRef(ctx, kind, ref)
+	if err != nil {
+		// Fall back to kind-wide recovery if we cannot resolve the id.
+		return s.handleLostWorkers(ctx, kind)
+	}
+
+	rt := s.runtime(kind)
+	if rt != nil && rt.Ready(ctx) == nil {
+		_ = rt.Unload(ctx, row.NativeID)
+	}
+
+	switch row.Observed {
+	case modelstate.ModelLoaded, modelstate.ModelLoading, modelstate.ModelUnloading, modelstate.ModelFailed:
+		_ = setModelObserved(ctx, row.ID, modelstate.ModelFailed, "worker process gone")
+		_ = setModelPID(ctx, row.ID, nil)
+		rlog.Warn("model worker lost",
+			"event", "control.model_worker_lost",
+			"model_id", row.ID,
+			"frontend", string(kind),
+			"exit_code", exitCode,
+		)
+	}
+	_ = refreshFrontendPIDs(ctx, kind)
+	_ = refreshRouteEnablement(ctx)
+
+	if s.restarts != nil {
+		s.restarts.onUnexpectedExit(ctx, row.ID, exitCode)
 	}
 	return nil
 }

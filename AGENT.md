@@ -20,7 +20,7 @@ Do not introduce services named `dataplane`, `identity`, `openai`, or `inference
 - `purpose=translation` accepts OpenAI `message.content` as a **string only** (BabelDOC / plain text). Do not widen translation to multimodal `content` arrays (`image_url`, etc.). Multimodal chat needs a **new catalog purpose** (and matching route/enablement) designed separately — do not overload `translation`.
 - This slice: **no auth** on chat, `/docs`, or `/openapi.json` (Bearer may be present and ignored).
 - Hard catalog failures (`model_not_loaded`, `route_disabled`, purpose mismatch, unsupported frontend) return OpenAI `{"error":{...}}` with **HTTP 4xx** and `X-Should-Retry: false`. openai-python auto-retries all 5xx; BabelDOC only tenacity-retries `RateLimitError`, then **falls back per-paragraph and keeps the job running** — it will not abort the whole PDF job on API errors. Do not "fix" that by returning 503.
-- Mid-flight worker death: mlxlm serializes Metal `generate` (queue concurrent BabelDOC calls), control reloads immediately on unexpected process exit, and gateway waits/reposts for up to ~3 minutes so a single BabelDOC request (600s client timeout) can survive a crash+reload.
+- Mid-flight worker death: mlxlm serializes Metal `generate` (queue concurrent BabelDOC calls); control applies catalog `restart_policy` (default `unless-stopped`) with backoff and a circuit break — Unload / `desired=unloaded` suppresses auto-restart; decision lives in control, not unix/gateway. Gateway waits/reposts for up to ~3 minutes so a single BabelDOC request (600s client timeout) can survive a crash+reload.
 
 ## Unix frontends
 

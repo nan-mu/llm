@@ -31,6 +31,7 @@ type Service struct {
 	grpcSrv  *grpc.Server
 	grpcLn   net.Listener
 	cancel   context.CancelFunc
+	restarts *restartController
 	mu       sync.Mutex
 }
 
@@ -44,6 +45,7 @@ func initService() (*Service, error) {
 		return nil, err
 	}
 	s := &Service{runtimes: rts}
+	s.restarts = newRestartController(s)
 	runCtx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
 	s.wireWorkerExitHandlers()
@@ -71,6 +73,9 @@ func (s *Service) abortBoot(err error) {
 		"event", "control.reconcile_failed",
 		"err", err,
 	)
+	if s.restarts != nil {
+		s.restarts.cancelAll()
+	}
 	drainCtx, cancel := context.WithTimeout(context.Background(), bootDrainTimeout)
 	defer cancel()
 	s.drainFrontends(drainCtx)
@@ -83,6 +88,9 @@ func (s *Service) abortBoot(err error) {
 }
 
 func (s *Service) Shutdown(force context.Context) {
+	if s.restarts != nil {
+		s.restarts.cancelAll()
+	}
 	if s.cancel != nil {
 		s.cancel()
 	}
@@ -120,11 +128,12 @@ func (s *Service) drainFrontends(ctx context.Context) {
 	}
 }
 
-// wireWorkerExitHandlers registers immediate reload on unexpected worker death
+// wireWorkerExitHandlers registers per-model recovery on unexpected worker death
 // (does not wait for the 10s memory sampler). Intentional Unload does not fire.
+// Restart policy / backoff live in RestartController.
 func (s *Service) wireWorkerExitHandlers() {
 	type exitAware interface {
-		SetWorkerExitHandler(fn func(id string))
+		SetWorkerExitHandler(fn func(id string, exitCode int))
 	}
 	for _, kind := range modelstate.AllFrontends() {
 		rt := s.runtime(kind)
@@ -133,17 +142,18 @@ func (s *Service) wireWorkerExitHandlers() {
 			continue
 		}
 		k := kind
-		aware.SetWorkerExitHandler(func(id string) {
+		aware.SetWorkerExitHandler(func(id string, exitCode int) {
 			rlog.Warn("worker exit notified",
 				"event", "control.worker_exit_notified",
 				"frontend", string(k),
 				"model_id", id,
+				"exit_code", exitCode,
 			)
 			go func() {
 				ctx, cancel := context.WithTimeout(context.Background(), loadTimeout+time.Minute)
 				defer cancel()
-				if err := s.handleLostWorkers(ctx, k); err != nil {
-					rlog.Error("handle lost workers after exit failed",
+				if err := s.handleLostModel(ctx, k, id, exitCode); err != nil {
+					rlog.Error("handle lost model after exit failed",
 						"event", "control.worker_exit_recover_failed",
 						"frontend", string(k),
 						"model_id", id,

@@ -41,8 +41,9 @@ type entry struct {
 }
 
 // ExitHandler is called when a worker exits unexpectedly (not via Unload).
-// id is the model id that was being served.
-type ExitHandler func(id string)
+// id is the model id that was being served; exitCode is from the child process
+// (-1 if unknown).
+type ExitHandler func(id string, exitCode int)
 
 // Supervisor is an in-memory table of per-model child processes.
 type Supervisor struct {
@@ -191,13 +192,15 @@ func (s *Supervisor) watchExit(id string, p *proc.Proc) {
 		handler := s.exitHandler
 		s.mu.Unlock()
 
+		exitCode := p.ExitCode()
 		logx.Warn("frontend worker exited",
 			"event", "frontend.worker_exited",
 			"kind", s.kind,
 			"model_id", id,
+			"exit_code", exitCode,
 		)
 		if handler != nil {
-			handler(id)
+			handler(id, exitCode)
 		}
 	}()
 }

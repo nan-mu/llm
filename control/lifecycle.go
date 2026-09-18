@@ -89,7 +89,32 @@ func (s *Service) loadModel(ctx context.Context, id string) (*Snapshot, error) {
 		return nil, err
 	}
 	row.Desired = modelstate.ModelLoaded
+	// Explicit Load clears circuit so operators can recover after RESTART_GAVE_UP.
+	if s.restarts != nil {
+		s.restarts.resetStreak(id)
+	}
 	recordEvent(ctx, id, eventLoad, map[string]string{"native_id": row.NativeID})
+	snap, err := s.applyLoadLocked(ctx, *row)
+	if err != nil {
+		return nil, err
+	}
+	return snap, nil
+}
+
+// loadModelForRestart is used by RestartController; it does not clear streak on entry.
+func (s *Service) loadModelForRestart(ctx context.Context, id string) (*Snapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	row, err := getModel(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if err := setModelDesired(ctx, id, modelstate.ModelLoaded); err != nil {
+		return nil, err
+	}
+	row.Desired = modelstate.ModelLoaded
+	recordEvent(ctx, id, eventLoad, map[string]string{"native_id": row.NativeID, "restart": "true"})
 	return s.applyLoadLocked(ctx, *row)
 }
 
@@ -200,6 +225,9 @@ func (s *Service) unloadLocked(ctx context.Context, id string, stopIfIdle bool) 
 		return nil, err
 	}
 	row.Desired = modelstate.ModelUnloaded
+	if s.restarts != nil {
+		s.restarts.cancel(id)
+	}
 	recordEvent(ctx, id, eventUnload, map[string]string{"native_id": row.NativeID})
 
 	rt := s.runtime(row.Frontend)

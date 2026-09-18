@@ -13,16 +13,18 @@ import (
 )
 
 type modelRow struct {
-	ID         string
-	Frontend   modelstate.FrontendKind
-	Path       string
-	Purpose    modelstate.Purpose
-	NativeID   string
-	Desired    modelstate.ModelState
-	Observed   modelstate.ModelState
-	LastError  string
-	SocketPath *string // nil for mlxlm
-	PID        *int64  // nil when unloaded
+	ID                string
+	Frontend          modelstate.FrontendKind
+	Path              string
+	Purpose           modelstate.Purpose
+	NativeID          string
+	Desired           modelstate.ModelState
+	Observed          modelstate.ModelState
+	LastError         string
+	SocketPath        *string // nil for mlxlm
+	PID               *int64  // nil when unloaded
+	RestartPolicy     string
+	RestartMaxRetries *int
 }
 
 type frontendRow struct {
@@ -39,15 +41,18 @@ func getModel(ctx context.Context, id string) (*modelRow, error) {
 	var lastErr sql.NullString
 	var sock sql.NullString
 	var pid sql.NullInt64
+	var maxRetries sql.NullInt64
 	err := db.QueryRow(ctx, `
 		SELECT m.id, m.frontend, m.path, m.purpose, m.native_id,
-		       m.desired_state, m.observed_state, m.last_error, f.socket_path, m.pid
+		       m.desired_state, m.observed_state, m.last_error, f.socket_path, m.pid,
+		       m.restart_policy, m.restart_max_retries
 		FROM models m
 		JOIN frontends f ON f.kind = m.frontend
 		WHERE m.id = $1
 	`, id).Scan(
 		&row.ID, &row.Frontend, &row.Path, &row.Purpose, &row.NativeID,
 		&row.Desired, &row.Observed, &lastErr, &sock, &pid,
+		&row.RestartPolicy, &maxRetries,
 	)
 	if errors.Is(err, sqldb.ErrNoRows) {
 		return nil, &errs.Error{Code: errs.NotFound, Message: "model not found"}
@@ -58,13 +63,55 @@ func getModel(ctx context.Context, id string) (*modelRow, error) {
 	row.LastError = lastErr.String
 	row.SocketPath = nullStringPtr(sock)
 	row.PID = nullInt64Ptr(pid)
+	row.RestartMaxRetries = nullIntPtr(maxRetries)
+	if row.RestartPolicy == "" {
+		row.RestartPolicy = restartPolicyUnlessStopped
+	}
+	return &row, nil
+}
+
+// getModelByFrontendRef resolves a catalog row by catalog id or native_id on kind.
+func getModelByFrontendRef(ctx context.Context, kind modelstate.FrontendKind, ref string) (*modelRow, error) {
+	var row modelRow
+	var lastErr sql.NullString
+	var sock sql.NullString
+	var pid sql.NullInt64
+	var maxRetries sql.NullInt64
+	err := db.QueryRow(ctx, `
+		SELECT m.id, m.frontend, m.path, m.purpose, m.native_id,
+		       m.desired_state, m.observed_state, m.last_error, f.socket_path, m.pid,
+		       m.restart_policy, m.restart_max_retries
+		FROM models m
+		JOIN frontends f ON f.kind = m.frontend
+		WHERE m.frontend = $1 AND (m.id = $2 OR m.native_id = $2)
+		ORDER BY CASE WHEN m.id = $2 THEN 0 ELSE 1 END
+		LIMIT 1
+	`, kind, ref).Scan(
+		&row.ID, &row.Frontend, &row.Path, &row.Purpose, &row.NativeID,
+		&row.Desired, &row.Observed, &lastErr, &sock, &pid,
+		&row.RestartPolicy, &maxRetries,
+	)
+	if errors.Is(err, sqldb.ErrNoRows) {
+		return nil, &errs.Error{Code: errs.NotFound, Message: "model not found"}
+	}
+	if err != nil {
+		return nil, err
+	}
+	row.LastError = lastErr.String
+	row.SocketPath = nullStringPtr(sock)
+	row.PID = nullInt64Ptr(pid)
+	row.RestartMaxRetries = nullIntPtr(maxRetries)
+	if row.RestartPolicy == "" {
+		row.RestartPolicy = restartPolicyUnlessStopped
+	}
 	return &row, nil
 }
 
 func listModels(ctx context.Context) ([]modelRow, error) {
 	rows, err := db.Query(ctx, `
 		SELECT m.id, m.frontend, m.path, m.purpose, m.native_id,
-		       m.desired_state, m.observed_state, m.last_error, f.socket_path, m.pid
+		       m.desired_state, m.observed_state, m.last_error, f.socket_path, m.pid,
+		       m.restart_policy, m.restart_max_retries
 		FROM models m
 		JOIN frontends f ON f.kind = m.frontend
 		ORDER BY m.id
@@ -79,7 +126,8 @@ func listModels(ctx context.Context) ([]modelRow, error) {
 func listDesiredLoaded(ctx context.Context) ([]modelRow, error) {
 	rows, err := db.Query(ctx, `
 		SELECT m.id, m.frontend, m.path, m.purpose, m.native_id,
-		       m.desired_state, m.observed_state, m.last_error, f.socket_path, m.pid
+		       m.desired_state, m.observed_state, m.last_error, f.socket_path, m.pid,
+		       m.restart_policy, m.restart_max_retries
 		FROM models m
 		JOIN frontends f ON f.kind = m.frontend
 		WHERE m.desired_state = 'loaded'
@@ -99,15 +147,21 @@ func scanModels(rows *sqldb.Rows) ([]modelRow, error) {
 		var lastErr sql.NullString
 		var sock sql.NullString
 		var pid sql.NullInt64
+		var maxRetries sql.NullInt64
 		if err := rows.Scan(
 			&row.ID, &row.Frontend, &row.Path, &row.Purpose, &row.NativeID,
 			&row.Desired, &row.Observed, &lastErr, &sock, &pid,
+			&row.RestartPolicy, &maxRetries,
 		); err != nil {
 			return nil, err
 		}
 		row.LastError = lastErr.String
 		row.SocketPath = nullStringPtr(sock)
 		row.PID = nullInt64Ptr(pid)
+		row.RestartMaxRetries = nullIntPtr(maxRetries)
+		if row.RestartPolicy == "" {
+			row.RestartPolicy = restartPolicyUnlessStopped
+		}
 		out = append(out, row)
 	}
 	return out, rows.Err()
@@ -329,6 +383,14 @@ func nullInt64Ptr(n sql.NullInt64) *int64 {
 		return nil
 	}
 	v := n.Int64
+	return &v
+}
+
+func nullIntPtr(n sql.NullInt64) *int {
+	if !n.Valid {
+		return nil
+	}
+	v := int(n.Int64)
 	return &v
 }
 

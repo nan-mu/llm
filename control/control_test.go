@@ -96,7 +96,11 @@ func newTestEnv(t *testing.T) *testEnv {
 		modelstate.FrontendMlxcel: mlxcelRt,
 		modelstate.FrontendMlxlm:  mlxlmRt,
 	}}
+	svc.restarts = newRestartController(svc)
 	t.Cleanup(func() {
+		if svc.restarts != nil {
+			svc.restarts.cancelAll()
+		}
 		if svc.grpcSrv != nil {
 			svc.grpcSrv.Stop()
 		}
@@ -124,13 +128,17 @@ func (e *testEnv) ctx(t *testing.T) context.Context {
 func setDesired(t *testing.T, ctx context.Context, loaded ...string) {
 	t.Helper()
 	if _, err := db.Exec(ctx, `
-		UPDATE models SET desired_state = 'unloaded', observed_state = 'unloaded', last_error = NULL, updated_at = NOW()
+		UPDATE models SET desired_state = 'unloaded', observed_state = 'unloaded', last_error = NULL,
+		       restart_policy = 'unless-stopped', restart_max_retries = NULL, updated_at = NOW()
 	`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(ctx, `
 		UPDATE frontends SET observed_state = 'stopped', last_error = NULL, updated_at = NOW()
 	`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(ctx, `DELETE FROM model_events`); err != nil {
 		t.Fatal(err)
 	}
 	for _, id := range loaded {

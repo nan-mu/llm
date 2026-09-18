@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"encore.app/internal/modelstate"
 )
@@ -132,23 +133,21 @@ func TestSampleRecoversLostWorker(t *testing.T) {
 	if err := rt.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
-	old := memoryMBFn
+	oldMem := memoryMBFn
 	memoryMBFn = func(pids []int64) (int64, error) {
 		t.Fatal("should not footprint when runtime reports no live pids")
 		return 0, nil
 	}
-	t.Cleanup(func() { memoryMBFn = old })
+	t.Cleanup(func() { memoryMBFn = oldMem })
+
+	oldBackoff := restartBackoffFor
+	restartBackoffFor = func(streak int) time.Duration { return 5 * time.Millisecond }
+	t.Cleanup(func() { restartBackoffFor = oldBackoff })
 
 	if err := env.svc.sampleFrontend(ctx, modelstate.FrontendMlxlm); err != nil {
 		t.Fatal(err)
 	}
-	snap, err := env.svc.lookupSnapshot(ctx, idGemma)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if snap.Observed != string(modelstate.ModelLoaded) {
-		t.Fatalf("after recover observed=%s", snap.Observed)
-	}
+	snap := waitObserved(t, env, idGemma, modelstate.ModelLoaded, 3*time.Second)
 	if snap.PID == nil || *snap.PID <= 0 {
 		t.Fatalf("expected new pid after recover")
 	}

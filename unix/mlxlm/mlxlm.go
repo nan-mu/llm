@@ -129,7 +129,8 @@ func (r *Runtime) BackendPIDs(ctx context.Context) ([]int, error) {
 }
 
 // SetWorkerExitHandler registers a callback for unexpected worker process death.
-func (r *Runtime) SetWorkerExitHandler(fn func(id string)) {
+// exitCode is the child process exit status (-1 if unknown).
+func (r *Runtime) SetWorkerExitHandler(fn func(id string, exitCode int)) {
 	r.sup.SetExitHandler(fn)
 }
 

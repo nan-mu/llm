@@ -8,17 +8,19 @@ import (
 )
 
 const (
-	eventLoad            = "LOAD"
-	eventLoaded          = "LOADED"
-	eventLoadFailed      = "LOAD_FAILED"
-	eventUnload          = "UNLOAD"
-	eventUnloaded        = "UNLOADED"
-	eventUnloadFailed    = "UNLOAD_FAILED"
-	eventReconcileStart  = "RECONCILE_START"
-	eventReconcileDone   = "RECONCILE_DONE"
-	eventReconcileFailed = "RECONCILE_FAILED"
-	eventFrontendStart   = "FRONTEND_START"
-	eventFrontendStop    = "FRONTEND_STOP"
+	eventLoad             = "LOAD"
+	eventLoaded           = "LOADED"
+	eventLoadFailed       = "LOAD_FAILED"
+	eventUnload           = "UNLOAD"
+	eventUnloaded         = "UNLOADED"
+	eventUnloadFailed     = "UNLOAD_FAILED"
+	eventReconcileStart   = "RECONCILE_START"
+	eventReconcileDone    = "RECONCILE_DONE"
+	eventReconcileFailed  = "RECONCILE_FAILED"
+	eventFrontendStart    = "FRONTEND_START"
+	eventFrontendStop     = "FRONTEND_STOP"
+	eventRestartScheduled = "RESTART_SCHEDULED"
+	eventRestartGaveUp    = "RESTART_GAVE_UP"
 )
 
 func recordEvent(ctx context.Context, model, event string, details map[string]string) {

@@ -2,6 +2,7 @@ package proc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -97,7 +98,10 @@ func (p *Proc) Start(ctx context.Context) error {
 	p.done = done
 	p.waitErr = nil
 	go func() {
-		p.waitErr = cmd.Wait()
+		err := cmd.Wait()
+		p.mu.Lock()
+		p.waitErr = err
+		p.mu.Unlock()
 		close(done)
 	}()
 
@@ -338,6 +342,21 @@ func (p *Proc) Done() <-chan struct{} {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.done
+}
+
+// ExitCode returns the child exit status after Done has closed.
+// 0 means clean exit; -1 means unknown (not waited yet, or non-ExitError).
+func (p *Proc) ExitCode() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.waitErr == nil {
+		return 0
+	}
+	var ee *exec.ExitError
+	if errors.As(p.waitErr, &ee) {
+		return ee.ExitCode()
+	}
+	return -1
 }
 
 // Alive reports whether the child is still running.
