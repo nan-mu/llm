@@ -74,8 +74,20 @@ func (c *Client) Healthy(ctx context.Context) error {
 }
 
 func (c *Client) ListModels(ctx context.Context) ([]unix.Model, error) {
+	return c.listModels(ctx, pathModels)
+}
+
+// ReloadModels rescans --models-dir. llama-server indexes that directory at start
+// (and when the process is reused via an existing socket); files added later are
+// invisible to POST /models/load until this refresh.
+func (c *Client) ReloadModels(ctx context.Context) error {
+	_, err := c.listModels(ctx, pathModels+"?reload=1")
+	return err
+}
+
+func (c *Client) listModels(ctx context.Context, path string) ([]unix.Model, error) {
 	var payload modelsListResponse
-	if err := c.doJSON(ctx, http.MethodGet, pathModels, nil, &payload); err != nil {
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &payload); err != nil {
 		return nil, unix.WrapUnavailable("list models", err)
 	}
 	out := make([]unix.Model, 0, len(payload.Data))

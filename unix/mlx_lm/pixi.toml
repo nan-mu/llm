@@ -1,0 +1,10 @@
+[workspace]
+name = "mlx_lm"
+channels = ["conda-forge"]
+platforms = ["osx-arm64"]
+
+[dependencies]
+python = "3.12.*"
+
+[pypi-dependencies]
+mlx-lm = ">=0.22.0"

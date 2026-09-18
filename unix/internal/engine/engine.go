@@ -18,7 +18,7 @@ const (
 	healthPoll          = 100 * time.Millisecond
 )
 
-// Engine is the shared Start/Stop/Load implementation used by llama and mlxcel.
+// Engine is the shared Start/Stop/Load implementation used by Unix frontends.
 type Engine struct {
 	kind   string
 	proc   *proc.Proc
@@ -76,6 +76,9 @@ func (e *Engine) Load(ctx context.Context, id string) error {
 	if err := e.Ready(ctx); err != nil {
 		return err
 	}
+	// llama-server / mlxcel-server index models-dir at process start. A reused
+	// socket (or weights copied in later) needs a rescan or Load returns 404.
+	_ = e.client.ReloadModels(ctx)
 	err := e.client.LoadModel(ctx, id)
 	if err != nil && !unix.Is(err, unix.CodeAlreadyRunning) {
 		return err
@@ -124,6 +127,13 @@ func (e *Engine) Get(ctx context.Context, id string) (unix.Model, error) {
 	return e.client.GetModel(ctx, id)
 }
 
+func (e *Engine) List(ctx context.Context) ([]unix.Model, error) {
+	if err := e.Ready(ctx); err != nil {
+		return nil, err
+	}
+	return e.client.ListModels(ctx)
+}
+
 func (e *Engine) EnsureReady(ctx context.Context) error {
 	if err := e.Ready(ctx); err == nil {
 		return nil
@@ -136,6 +146,32 @@ func (e *Engine) EnsureLoaded(ctx context.Context, id string) error {
 		return err
 	}
 	return e.Load(ctx, id)
+}
+
+// ModelPID returns the frontend process pid when the named model is loaded.
+func (e *Engine) ModelPID(ctx context.Context, id string) (int, error) {
+	info, err := e.Get(ctx, id)
+	if err != nil {
+		return 0, err
+	}
+	if info.State != modelstate.ModelLoaded {
+		return 0, &unix.Error{Code: unix.CodeNotRunning, Message: "model not running"}
+	}
+	pid := e.proc.PID()
+	if pid <= 0 {
+		return 0, &unix.Error{Code: unix.CodeBackendUnavailable, Message: "frontend process not running"}
+	}
+	return pid, nil
+}
+
+// BackendPIDs returns the single frontend process pid, or empty if not alive.
+func (e *Engine) BackendPIDs(ctx context.Context) ([]int, error) {
+	_ = ctx
+	pid := e.proc.PID()
+	if pid <= 0 {
+		return nil, nil
+	}
+	return []int{pid}, nil
 }
 
 func (e *Engine) readyLocked(ctx context.Context) error {

@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -89,6 +90,7 @@ func (p *Proc) Start(ctx context.Context) error {
 	if err := cmd.Start(); err != nil {
 		return err
 	}
+	_ = os.WriteFile(p.pidPath(), []byte(strconv.Itoa(cmd.Process.Pid)), 0o644)
 
 	done := make(chan struct{})
 	p.cmd = cmd
@@ -136,39 +138,31 @@ func (p *Proc) killLocked() {
 	p.removeSocket()
 }
 
-// Stop sends SIGTERM to the process group, then SIGKILL if ctx ends first.
+// Stop sends SIGTERM to the frontend (and any instance children), then SIGKILL if ctx ends first.
 func (p *Proc) Stop(ctx context.Context) error {
 	p.mu.Lock()
 	cmd := p.cmd
 	done := p.done
 	p.mu.Unlock()
 
-	if cmd == nil || cmd.Process == nil {
-		p.removeSocket()
-		return nil
-	}
+	pids := p.frontendPIDs(cmd)
+	p.signalPIDs(pids, syscall.SIGTERM)
 
-	pgid, err := syscall.Getpgid(cmd.Process.Pid)
-	if err != nil {
-		_ = cmd.Process.Signal(syscall.SIGTERM)
-	} else {
-		_ = syscall.Kill(-pgid, syscall.SIGTERM)
-	}
-
-	if done == nil {
-		p.removeSocket()
-		return nil
+	wait := done
+	if wait == nil {
+		wait = make(chan struct{})
+		close(wait)
 	}
 
 	select {
-	case <-done:
+	case <-wait:
+		p.waitPIDs(ctx, pids)
 	case <-ctx.Done():
-		if pgid > 0 {
-			_ = syscall.Kill(-pgid, syscall.SIGKILL)
-		} else {
-			_ = cmd.Process.Kill()
+		p.signalPIDs(pids, syscall.SIGKILL)
+		if done != nil {
+			<-done
 		}
-		<-done
+		p.waitPIDs(context.Background(), pids)
 	}
 
 	p.mu.Lock()
@@ -185,11 +179,195 @@ func (p *Proc) Stop(ctx context.Context) error {
 	return nil
 }
 
+func (p *Proc) pidPath() string {
+	if p.cfg.SocketPath == "" {
+		return ""
+	}
+	return p.cfg.SocketPath + ".pid"
+}
+
+func (p *Proc) frontendPIDs(cmd *exec.Cmd) []int {
+	seen := map[int]struct{}{}
+	add := func(pid int) {
+		if pid > 1 && pid != os.Getpid() {
+			seen[pid] = struct{}{}
+		}
+	}
+	if cmd != nil && cmd.Process != nil {
+		add(cmd.Process.Pid)
+	}
+	for _, pid := range readPIDFile(p.pidPath()) {
+		add(pid)
+	}
+	for _, pid := range pidsHoldingSocket(p.cfg.SocketPath, p.cfg.Kind) {
+		add(pid)
+	}
+	out := make([]int, 0, len(seen))
+	for pid := range seen {
+		out = append(out, pid)
+	}
+	return out
+}
+
+func (p *Proc) signalPIDs(pids []int, sig syscall.Signal) {
+	// Prefer process-group kill so Python/mlx workers and their children die together.
+	seenPG := map[int]struct{}{}
+	for _, pid := range pids {
+		if pgid, err := syscall.Getpgid(pid); err == nil && pgid > 1 {
+			if _, ok := seenPG[pgid]; !ok {
+				seenPG[pgid] = struct{}{}
+				_ = syscall.Kill(-pgid, sig)
+			}
+		}
+		_ = syscall.Kill(pid, sig)
+	}
+}
+
+func (p *Proc) waitPIDs(ctx context.Context, pids []int) {
+	deadline := time.Now().Add(2 * time.Second)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	for time.Now().Before(deadline) {
+		alive := false
+		for _, pid := range pids {
+			if err := syscall.Kill(pid, 0); err == nil {
+				alive = true
+				break
+			}
+		}
+		if !alive {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
+func readPIDFile(path string) []int {
+	if path == "" {
+		return nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || pid <= 1 {
+		return nil
+	}
+	return []int{pid}
+}
+
+func pidsHoldingSocket(socketPath, kind string) []int {
+	socketPath = strings.TrimSpace(socketPath)
+	if socketPath == "" {
+		return nil
+	}
+	abs, err := filepath.Abs(socketPath)
+	if err != nil {
+		abs = socketPath
+	}
+	base := filepath.Base(abs)
+	dir := filepath.Dir(abs)
+	cmd := exec.Command("lsof", "-nP", "-U")
+	out, _ := cmd.Output()
+	if len(out) == 0 {
+		return nil
+	}
+	kind = strings.ToLower(kind)
+	seen := map[int]struct{}{}
+	for _, line := range strings.Split(string(out), "\n") {
+		if !strings.Contains(line, base) {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		pid, err := strconv.Atoi(fields[1])
+		if err != nil || pid <= 1 {
+			continue
+		}
+		cwd := processCWD(pid)
+		if cwd != "" && cwd != dir {
+			name := strings.ToLower(fields[0])
+			if !strings.Contains(name, kind) &&
+				!strings.Contains(name, "llama") &&
+				!strings.Contains(name, "mlxcel") &&
+				!strings.Contains(name, "mlxlm") &&
+				!strings.Contains(name, "fakemlx") &&
+				!strings.Contains(name, "python") {
+				continue
+			}
+		}
+		seen[pid] = struct{}{}
+	}
+	pids := make([]int, 0, len(seen))
+	for pid := range seen {
+		pids = append(pids, pid)
+	}
+	return pids
+}
+
+func processCWD(pid int) string {
+	out, err := exec.Command("lsof", "-a", "-d", "cwd", "-p", strconv.Itoa(pid), "-Fn").Output()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.HasPrefix(line, "n") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "n"))
+		}
+	}
+	return ""
+}
+
+func (p *Proc) removeSocket() {
+	if p.cfg.SocketPath != "" {
+		_ = os.Remove(p.cfg.SocketPath)
+		_ = os.Remove(p.pidPath())
+	}
+}
+
 // Alive reports whether the child is still running.
 func (p *Proc) Alive() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.aliveLocked()
+}
+
+// PID returns the worker process id, or 0 if not running.
+// When a Unix socket is configured, prefer the PID holding that socket
+// (e.g. python under a pixi/wrapper parent) over the direct child PID.
+func (p *Proc) PID() int {
+	p.mu.Lock()
+	alive := p.aliveLocked()
+	direct := 0
+	if alive && p.cmd != nil && p.cmd.Process != nil {
+		direct = p.cmd.Process.Pid
+	}
+	sock := p.cfg.SocketPath
+	kind := p.cfg.Kind
+	p.mu.Unlock()
+	if !alive {
+		return 0
+	}
+	if sock != "" {
+		holders := pidsHoldingSocket(sock, kind)
+		for _, h := range holders {
+			if h > 1 && h != direct {
+				return h
+			}
+		}
+		if len(holders) > 0 && holders[0] > 1 {
+			return holders[0]
+		}
+	}
+	return direct
 }
 
 func (p *Proc) aliveLocked() bool {
@@ -201,12 +379,6 @@ func (p *Proc) aliveLocked() bool {
 		return false
 	default:
 		return true
-	}
-}
-
-func (p *Proc) removeSocket() {
-	if p.cfg.SocketPath != "" {
-		_ = os.Remove(p.cfg.SocketPath)
 	}
 }
 

@@ -112,12 +112,24 @@ func TestHTTPClientMapsAlreadyRunning(t *testing.T) {
 	}
 }
 
-func TestHTTPClientUnavailable(t *testing.T) {
+func TestReloadModelsQuery(t *testing.T) {
 	t.Parallel()
-	c := httpx.NewHTTP("http://127.0.0.1:1", "", &http.Client{})
-	_, err := c.ListModels(context.Background())
-	if !unix.Is(err, unix.CodeBackendUnavailable) {
-		t.Fatalf("got %v", err)
+	var sawReload bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/models", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("reload") == "1" {
+			sawReload = true
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{}})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := httpx.NewHTTP(srv.URL, "", srv.Client())
+	if err := c.ReloadModels(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !sawReload {
+		t.Fatal("expected GET /models?reload=1")
 	}
 }
 

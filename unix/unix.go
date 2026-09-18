@@ -1,4 +1,4 @@
-// Package unix is the frontend runtime library for llama-server and mlxcel-server.
+// Package unix is the frontend runtime library for llama-server, mlxcel-server, and mlxlm.
 // It is not an Encore service.
 package unix
 
@@ -9,7 +9,7 @@ import (
 	"encore.app/internal/modelstate"
 )
 
-// Model is one frontend-native model as reported by llama-server / mlxcel-server.
+// Model is one frontend-native model as reported by a Unix frontend.
 type Model struct {
 	ID    string
 	Path  string
@@ -25,8 +25,13 @@ type Runtime interface {
 	Load(ctx context.Context, id string) error
 	Unload(ctx context.Context, id string) error
 	Get(ctx context.Context, id string) (Model, error)
+	List(ctx context.Context) ([]Model, error)
 	EnsureReady(ctx context.Context) error
 	EnsureLoaded(ctx context.Context, id string) error
+	// ModelPID returns the OS pid for a loaded model, or an error if not found/running.
+	ModelPID(ctx context.Context, id string) (int, error)
+	// BackendPIDs returns live frontend process ids (empty if none).
+	BackendPIDs(ctx context.Context) ([]int, error)
 }
 
 // Inferencer is the gateway-plane surface. This slice does not implement it.

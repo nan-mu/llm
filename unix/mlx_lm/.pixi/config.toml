@@ -1,0 +1,3 @@
+# Project-local: prefer upstream conda-forge (global tuna mirror may 403).
+[mirrors]
+"https://conda.anaconda.org/conda-forge" = ["https://conda.anaconda.org/conda-forge"]
