@@ -151,12 +151,12 @@ func TestSampleRecoversLostWorker(t *testing.T) {
 	if snap.PID == nil || *snap.PID <= 0 {
 		t.Fatalf("expected new pid after recover")
 	}
-	chat, err := isRouteEnabled(ctx, "POST /v1/chat/completions")
+	tr, err := isRouteEnabled(ctx, "POST /v1/translations", "structured_translation")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !chat {
-		t.Fatal("chat route should be enabled after recover")
+	if !tr {
+		t.Fatal("translations route should be enabled after recover")
 	}
 }
 

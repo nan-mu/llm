@@ -3,27 +3,31 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
 	"encore.app/control"
+	"encore.app/frontend/llama"
+	"encore.app/gateway/validate"
 	"encore.app/internal/modelstate"
-	"encore.app/unix/mlxlm"
+	unixsvc "encore.app/unix"
 	"encore.dev/middleware"
 	"encore.dev/rlog"
 	"encore.dev/storage/sqldb"
 )
 
 const (
-	routeChat           = "POST /v1/chat/completions"
-	backendRecoverWait  = 3 * time.Minute
-	backendRecoverPoll  = 500 * time.Millisecond
+	routeChat          = validate.RouteChat
+	routeTranslations  = validate.RouteTranslations
+	backendRecoverWait = 3 * time.Minute
+	backendRecoverPoll = 500 * time.Millisecond
 )
 
 //encore:service
 type Service struct {
-	chat *mlxlm.ChatProxy
+	llamaChat *llama.ChatProxy
 }
 
 var db = sqldb.NewDatabase("gateway", sqldb.DatabaseConfig{
@@ -31,11 +35,11 @@ var db = sqldb.NewDatabase("gateway", sqldb.DatabaseConfig{
 })
 
 func initService() (*Service, error) {
-	proxy, err := mlxlm.NewChatProxy()
+	llamaProxy, err := llama.NewChatProxy()
 	if err != nil {
 		return nil, err
 	}
-	return &Service{chat: proxy}, nil
+	return &Service{llamaChat: llamaProxy}, nil
 }
 
 // Health reports that the gateway service is up.
@@ -46,25 +50,32 @@ func (s *Service) Health(ctx context.Context) error {
 	return db.QueryRow(ctx, "SELECT 1").Scan(&n)
 }
 
-// ChatMessage is one OpenAI chat message.
+// ChatMessage is one OpenAI chat message (string content only).
 type ChatMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
 }
 
-// ResponseFormat is OpenAI response_format.
-type ResponseFormat struct {
-	Type string `json:"type"`
+// ChatCompletionsRequest is the OpenAI chat completions body (strict OpenAI fields).
+type ChatCompletionsRequest struct {
+	Model       string        `json:"model"`
+	Messages    []ChatMessage `json:"messages"`
+	Temperature *float64      `json:"temperature,omitempty"`
+	TopP        *float64      `json:"top_p,omitempty"`
+	MaxTokens   *int          `json:"max_tokens,omitempty"`
+	Stream      bool          `json:"stream,omitempty"`
 }
 
-// ChatCompletionsRequest is the OpenAI chat completions body (typed for Encore UI).
-type ChatCompletionsRequest struct {
-	Model          string          `json:"model"`
-	Messages       []ChatMessage   `json:"messages"`
-	Temperature    *float64        `json:"temperature,omitempty"`
-	MaxTokens      *int            `json:"max_tokens,omitempty"`
-	Stream         bool            `json:"stream,omitempty"`
-	ResponseFormat *ResponseFormat `json:"response_format,omitempty"`
+// chatForwardBody is marshaled to the Unix worker (may include injected top_k / repetition_penalty).
+type chatForwardBody struct {
+	Model             string        `json:"model"`
+	Messages          []ChatMessage `json:"messages"`
+	Temperature       *float64      `json:"temperature,omitempty"`
+	TopP              *float64      `json:"top_p,omitempty"`
+	TopK              *int          `json:"top_k,omitempty"`
+	RepetitionPenalty *float64      `json:"repetition_penalty,omitempty"`
+	MaxTokens         *int          `json:"max_tokens,omitempty"`
+	Stream            bool          `json:"stream,omitempty"`
 }
 
 // ChatChoice is one completion choice.
@@ -74,7 +85,7 @@ type ChatChoice struct {
 	FinishReason string      `json:"finish_reason"`
 }
 
-// ChatUsage is token usage.
+// ChatUsage is OpenAI token usage.
 type ChatUsage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
@@ -89,8 +100,6 @@ type OpenAIError struct {
 }
 
 // ChatCompletionsResponse is either a completion or an OpenAI error envelope.
-// Business failures set Error and return err=nil so the JSON stays {"error":{...}}
-// instead of Encore's {"code","message"}; openaiHTTPStatus sets the HTTP status.
 type ChatCompletionsResponse struct {
 	ID      string       `json:"id,omitempty"`
 	Object  string       `json:"object,omitempty"`
@@ -101,19 +110,12 @@ type ChatCompletionsResponse struct {
 	Error   *OpenAIError `json:"error,omitempty"`
 }
 
-// ChatCompletions is the OpenAI-compatible chat endpoint. Unauthenticated in this slice.
-// Typed request (Encore panel forms) + OpenAI error body via Error field + middleware status.
+// ChatCompletions proxies a validated chat body to the matching Unix ChatProxy.
 //
 //encore:api public method=POST path=/v1/chat/completions tag:openai
 func (s *Service) ChatCompletions(ctx context.Context, req *ChatCompletionsRequest) (*ChatCompletionsResponse, error) {
 	if req == nil || strings.TrimSpace(req.Model) == "" {
 		return openaiError("invalid_request_error", "model required", ""), nil
-	}
-	if len(req.Messages) == 0 {
-		return openaiError("invalid_request_error", "messages required", ""), nil
-	}
-	if req.Stream {
-		return openaiError("invalid_request_error", "streaming not supported", ""), nil
 	}
 
 	catalogID := strings.TrimSpace(req.Model)
@@ -121,36 +123,48 @@ func (s *Service) ChatCompletions(ctx context.Context, req *ChatCompletionsReque
 	if err != nil {
 		return openaiError("invalid_request_error", "model not found", "model_not_found"), nil
 	}
-	if snap.Purpose != string(modelstate.PurposeTranslation) {
+	purpose := modelstate.Purpose(snap.Purpose)
+	if purpose != modelstate.PurposeTranslation {
 		return openaiError("invalid_request_error",
 			"model purpose does not match chat completions", "model_purpose_mismatch"), nil
-	}
-
-	enabled, err := control.RouteEnabled(ctx, &control.RouteEnabledParams{Route: routeChat})
-	if err != nil {
-		rlog.Error("route enabled check failed", "event", "gateway.route_check_failed", "err", err)
-		return openaiError("server_error", "route check failed", ""), nil
-	}
-	if !enabled.Enabled {
-		// Permanent until an operator loads a model — must not look like a transient 5xx.
-		return openaiError("invalid_request_error",
-			"chat route disabled: no loaded translation model", "route_disabled"), nil
 	}
 	if snap.Observed != string(modelstate.ModelLoaded) {
 		return openaiError("invalid_request_error", "model not loaded", "model_not_loaded"), nil
 	}
-	if modelstate.FrontendKind(snap.Frontend) != modelstate.FrontendMlxlm || s.chat == nil {
+	frontend := modelstate.FrontendKind(snap.Frontend)
+	if frontend != modelstate.FrontendLlama && frontend != modelstate.FrontendMlxlm {
 		return openaiError("invalid_request_error", "frontend does not support chat", "frontend_unsupported"), nil
 	}
 
-	fwd := *req
-	fwd.Model = snap.NativeID
+	fwd := chatForwardBody{
+		Model:       snap.NativeID,
+		Messages:    req.Messages,
+		Temperature: req.Temperature,
+		TopP:        req.TopP,
+		MaxTokens:   req.MaxTokens,
+		Stream:      req.Stream,
+	}
+	if rw := rewrittenChatFromCtx(ctx); rw != nil {
+		fwd.Temperature = rw.Temperature
+		fwd.TopP = rw.TopP
+		fwd.TopK = rw.TopK
+		fwd.RepetitionPenalty = rw.RepetitionPenalty
+		fwd.MaxTokens = rw.MaxTokens
+		fwd.Stream = rw.Stream
+		fwd.Messages = make([]ChatMessage, len(rw.Messages))
+		for i, m := range rw.Messages {
+			var content string
+			_ = json.Unmarshal(m.Content, &content)
+			fwd.Messages[i] = ChatMessage{Role: m.Role, Content: content}
+		}
+	}
+
 	body, err := json.Marshal(&fwd)
 	if err != nil {
 		return openaiError("invalid_request_error", "invalid request body", ""), nil
 	}
 
-	status, raw, err := s.chat.PostChatCompletions(ctx, snap.NativeID, body)
+	status, raw, err := s.postChat(ctx, frontend, snap.NativeID, body)
 	if backendTransient(err, status) {
 		rlog.Warn("chat backend unavailable; waiting for worker recovery",
 			"event", "gateway.chat_recover_wait",
@@ -158,15 +172,20 @@ func (s *Service) ChatCompletions(ctx context.Context, req *ChatCompletionsReque
 			"err", err,
 			"status", status,
 		)
-		status, raw, err = s.waitRecoverChat(ctx, catalogID, snap.NativeID, body)
+		status, raw, err = s.waitRecoverChat(ctx, catalogID, snap.NativeID, frontend, body)
 	}
 	if err != nil {
+		if _, ok := err.(frontendUnsupportedError); ok {
+			return openaiError("invalid_request_error", "frontend does not support chat", "frontend_unsupported"), nil
+		}
 		rlog.Error("chat proxy failed", "event", "gateway.chat_failed", "err", err, "model", catalogID)
-		// Still transient from the client's view only if recovery failed mid-flight.
 		return openaiError("server_error", "backend unavailable", "backend_unavailable"), nil
 	}
 	if status >= 400 {
 		if out, ok := parseBackendOpenAIError(raw); ok {
+			return out, nil
+		}
+		if out, ok := parseWorkerInferError(raw); ok {
 			return out, nil
 		}
 		msg := strings.TrimSpace(string(raw))
@@ -180,6 +199,19 @@ func (s *Service) ChatCompletions(ctx context.Context, req *ChatCompletionsReque
 		return openaiError(typ, msg, ""), nil
 	}
 
+	if frontend == modelstate.FrontendMlxlm {
+		text, usage, err := parseWorkerInfer(raw)
+		if err != nil {
+			return openaiError("server_error", "invalid backend response", ""), nil
+		}
+		return &ChatCompletionsResponse{
+			Object:  "chat.completion",
+			Model:   catalogID,
+			Choices: []ChatChoice{{Index: 0, Message: ChatMessage{Role: "assistant", Content: text}, FinishReason: "stop"}},
+			Usage:   usage,
+		}, nil
+	}
+
 	var out ChatCompletionsResponse
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return openaiError("server_error", "invalid backend response", ""), nil
@@ -189,17 +221,41 @@ func (s *Service) ChatCompletions(ctx context.Context, req *ChatCompletionsReque
 	return &out, nil
 }
 
+func (s *Service) postChat(ctx context.Context, frontend modelstate.FrontendKind, nativeID string, body []byte) (int, []byte, error) {
+	switch frontend {
+	case modelstate.FrontendLlama:
+		if s.llamaChat == nil {
+			return http.StatusBadRequest, nil, errFrontendUnsupported
+		}
+		return s.llamaChat.PostChatCompletions(ctx, nativeID, body, nil)
+	case modelstate.FrontendMlxlm:
+		res, err := unixsvc.Chat(ctx, nativeID, &unixsvc.ChatBody{Body: body})
+		if err != nil {
+			return http.StatusBadGateway, nil, err
+		}
+		return http.StatusOK, []byte(res.Body), nil
+	default:
+		return http.StatusBadRequest, nil, errFrontendUnsupported
+	}
+}
+
+type frontendUnsupportedError struct{}
+
+func (frontendUnsupportedError) Error() string { return "frontend_unsupported" }
+
+var errFrontendUnsupported = frontendUnsupportedError{}
+
 func backendTransient(err error, status int) bool {
 	if err != nil {
+		if _, ok := err.(frontendUnsupportedError); ok {
+			return false
+		}
 		return true
 	}
 	return status == http.StatusBadGateway || status == http.StatusServiceUnavailable || status >= 500
 }
 
-// waitRecoverChat polls until control reloads the worker and a chat POST succeeds,
-// or until the deadline / context cancel. Absorbs mid-flight worker crashes so
-// long BabelDOC requests (timeout 600s) can complete without client-side storms.
-func (s *Service) waitRecoverChat(ctx context.Context, catalogID, nativeID string, body []byte) (int, []byte, error) {
+func (s *Service) waitRecoverChat(ctx context.Context, catalogID, nativeID string, frontend modelstate.FrontendKind, body []byte) (int, []byte, error) {
 	deadline := time.Now().Add(backendRecoverWait)
 	var lastStatus int
 	var lastRaw []byte
@@ -225,7 +281,7 @@ func (s *Service) waitRecoverChat(ctx context.Context, catalogID, nativeID strin
 		if snap.Observed != string(modelstate.ModelLoaded) {
 			continue
 		}
-		lastStatus, lastRaw, lastErr = s.chat.PostChatCompletions(ctx, nativeID, body)
+		lastStatus, lastRaw, lastErr = s.postChat(ctx, frontend, nativeID, body)
 		if !backendTransient(lastErr, lastStatus) {
 			rlog.Info("chat backend recovered",
 				"event", "gateway.chat_recover_ok",
@@ -243,10 +299,6 @@ func (s *Service) waitRecoverChat(ctx context.Context, catalogID, nativeID strin
 	return http.StatusBadGateway, nil, nil
 }
 
-// openaiHTTPStatus sets 4xx/5xx when the handler returned an OpenAI error payload
-// with err=nil (so the body is {"error":...} instead of Encore errs JSON).
-// Also sets X-Should-Retry so openai-python does not auto-retry hard failures.
-//
 //encore:middleware target=tag:openai
 func openaiHTTPStatus(req middleware.Request, next middleware.Next) middleware.Response {
 	resp := next(req)
@@ -278,6 +330,31 @@ func parseBackendOpenAIError(raw []byte) (*ChatCompletionsResponse, bool) {
 	return &out, true
 }
 
+type workerInferResponse struct {
+	Content string     `json:"content"`
+	Usage   *ChatUsage `json:"usage"`
+	Error   *OpenAIError `json:"error"`
+}
+
+func parseWorkerInfer(raw []byte) (string, *ChatUsage, error) {
+	var out workerInferResponse
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return "", nil, err
+	}
+	if out.Error != nil {
+		return "", out.Usage, fmt.Errorf("%s", out.Error.Message)
+	}
+	return out.Content, out.Usage, nil
+}
+
+func parseWorkerInferError(raw []byte) (*ChatCompletionsResponse, bool) {
+	var out workerInferResponse
+	if err := json.Unmarshal(raw, &out); err != nil || out.Error == nil {
+		return nil, false
+	}
+	return openaiError(out.Error.Type, out.Error.Message, out.Error.Code), true
+}
+
 func openAIErrorHTTPStatus(e *OpenAIError) int {
 	if e == nil {
 		return http.StatusBadGateway
@@ -286,8 +363,6 @@ func openAIErrorHTTPStatus(e *OpenAIError) int {
 	case "model_not_found":
 		return http.StatusNotFound
 	case "model_purpose_mismatch", "route_disabled", "model_not_loaded", "frontend_unsupported":
-		// 4xx: openai-python only auto-retries 408/409/429/5xx. BabelDOC tenacity
-		// only retries RateLimitError. Catalog/hard failures must not look transient.
 		return http.StatusBadRequest
 	case "backend_unavailable":
 		return http.StatusBadGateway
@@ -299,11 +374,6 @@ func openAIErrorHTTPStatus(e *OpenAIError) int {
 }
 
 func openAIErrorRetryable(e *OpenAIError) bool {
-	if e == nil {
-		return false
-	}
-	// Gateway already waited for worker reload on backend_unavailable; do not
-	// invite openai-python / BabelDOC to stampede the endpoint.
 	return false
 }
 
@@ -321,7 +391,7 @@ type ModelEntry struct {
 	OwnedBy string `json:"owned_by"`
 }
 
-// ListModels lists loaded translation models.
+// ListModels lists loaded translation models (BabelDOC / HY-MT2). Not Gemma.
 //
 //encore:api public method=GET path=/v1/models
 func (s *Service) ListModels(ctx context.Context) (*ListModelsResponse, error) {

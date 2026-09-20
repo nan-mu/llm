@@ -4,7 +4,6 @@ import (
 	"context"
 	"strings"
 
-	"encore.app/internal/modelstate"
 	"encore.dev/beta/errs"
 )
 
@@ -50,35 +49,41 @@ func (s *Service) ListEnabledRoutes(ctx context.Context) (*ListRoutesResponse, e
 
 // RouteEnabledParams is the query for RouteEnabled.
 type RouteEnabledParams struct {
-	Route string `query:"route"`
+	Route   string `query:"route"`
+	Purpose string `query:"purpose"`
 }
 
-// RouteEnabledResponse reports whether one route is enabled.
+// RouteEnabledResponse reports whether one (route, purpose) pair is enabled.
 type RouteEnabledResponse struct {
 	Route   string `json:"route"`
+	Purpose string `json:"purpose"`
 	Enabled bool   `json:"enabled"`
 }
 
-// RouteEnabled reports whether a single OpenAI route is enabled.
+// RouteEnabled reports whether a single (route, purpose) row is enabled.
 //
 //encore:api private method=GET path=/control/routes/check
 func (s *Service) RouteEnabled(ctx context.Context, p *RouteEnabledParams) (*RouteEnabledResponse, error) {
 	route := strings.TrimSpace(p.Route)
+	purpose := strings.TrimSpace(p.Purpose)
 	if route == "" {
 		return nil, &errs.Error{Code: errs.InvalidArgument, Message: "route required"}
 	}
-	enabled, err := isRouteEnabled(ctx, route)
+	if purpose == "" {
+		return nil, &errs.Error{Code: errs.InvalidArgument, Message: "purpose required"}
+	}
+	enabled, err := isRouteEnabled(ctx, route, purpose)
 	if err != nil {
 		return nil, err
 	}
-	return &RouteEnabledResponse{Route: route, Enabled: enabled}, nil
+	return &RouteEnabledResponse{Route: route, Purpose: purpose, Enabled: enabled}, nil
 }
 
 func listAPIRoutes(ctx context.Context) ([]RouteInfo, error) {
 	rows, err := db.Query(ctx, `
 		SELECT route, purpose, enabled
 		FROM api_routes
-		ORDER BY route
+		ORDER BY route, purpose
 	`)
 	if err != nil {
 		return nil, err
@@ -95,11 +100,11 @@ func listAPIRoutes(ctx context.Context) ([]RouteInfo, error) {
 	return out, rows.Err()
 }
 
-func isRouteEnabled(ctx context.Context, route string) (bool, error) {
+func isRouteEnabled(ctx context.Context, route, purpose string) (bool, error) {
 	var enabled bool
 	err := db.QueryRow(ctx, `
-		SELECT enabled FROM api_routes WHERE route = $1
-	`, route).Scan(&enabled)
+		SELECT enabled FROM api_routes WHERE route = $1 AND purpose = $2
+	`, route, purpose).Scan(&enabled)
 	if err != nil {
 		return false, err
 	}
@@ -109,13 +114,29 @@ func isRouteEnabled(ctx context.Context, route string) (bool, error) {
 // refreshRouteEnablement sets each api_routes.enabled from whether any
 // model with that purpose is observed_state = loaded.
 func refreshRouteEnablement(ctx context.Context) error {
-	purposes := []modelstate.Purpose{modelstate.PurposeTranslation, modelstate.PurposeASR}
-	for _, purpose := range purposes {
+	rows, err := db.Query(ctx, `SELECT route, purpose FROM api_routes`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	type key struct{ route, purpose string }
+	var keys []key
+	for rows.Next() {
+		var k key
+		if err := rows.Scan(&k.route, &k.purpose); err != nil {
+			return err
+		}
+		keys = append(keys, k)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, k := range keys {
 		var n int
 		err := db.QueryRow(ctx, `
 			SELECT COUNT(*) FROM models
 			WHERE purpose = $1 AND observed_state = 'loaded'
-		`, string(purpose)).Scan(&n)
+		`, k.purpose).Scan(&n)
 		if err != nil {
 			return err
 		}
@@ -123,8 +144,8 @@ func refreshRouteEnablement(ctx context.Context) error {
 		_, err = db.Exec(ctx, `
 			UPDATE api_routes
 			SET enabled = $1, updated_at = NOW()
-			WHERE purpose = $2 AND enabled IS DISTINCT FROM $1
-		`, enabled, string(purpose))
+			WHERE route = $2 AND purpose = $3 AND enabled IS DISTINCT FROM $1
+		`, enabled, k.route, k.purpose)
 		if err != nil {
 			return err
 		}

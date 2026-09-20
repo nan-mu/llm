@@ -4,69 +4,64 @@ Stable architecture decisions for this Encore app. Do not treat this as an end-u
 
 ## Services
 
-Two Encore services only:
+Three Encore services:
 
-- `gateway` — sole **business** OpenAI-compatible HTTP surface (`POST /v1/chat/completions`, `GET /v1/models`, plus `/docs` and `/openapi.json`). Future: API tokens, sessions, usage.
+- `gateway` — sole **business** OpenAI-compatible HTTP surface (`POST /v1/chat/completions`, `POST /v1/translations`, `GET /v1/models`, plus `/docs` and `/openapi.json`). Future: API tokens, sessions, usage.
 - `control` — model catalog, observed residency/frontend state, frontend management, localhost gRPC Load/Unload. Narrow public HTTP only: `/control/health`, `/control/routes`. Do not expose gRPC, Load/Unload, sockets, or secrets via those pages.
+- `unix` — private infer router only (`POST /unix/chat/:native_id`). Opaque prompt JSON in / out (`body` field for Encore S2S). **No middleware.** Dials mlxlm JSON-over-UDS. Does not Start/Load models.
 
 Do not introduce services named `dataplane`, `identity`, `openai`, or `inference`.
 
 ## OpenAI routing (this slice)
 
-- Request `model` is a **catalog id**. Gateway calls `control.GetSnapshot`, reads `purpose`, and checks `api_routes` enablement. Do not add a dedicated `/translate` path.
-- `purpose=translation` → chat completions; `purpose=asr` → transcriptions (not implemented yet).
-- Gateway must not invent enablement by scanning `models`; use `control.RouteEnabled` / `ListEnabledRoutes`. `api_routes.enabled` flips after successful Load/Unload/reconcile when ≥1 model with that purpose is `observed_state=loaded`.
-- Pass through `messages` (and other forwardable fields). **No** gateway translation system prompt.
-- `purpose=translation` accepts OpenAI `message.content` as a **string only** (BabelDOC / plain text). Do not widen translation to multimodal `content` arrays (`image_url`, etc.). Multimodal chat needs a **new catalog purpose** (and matching route/enablement) designed separately — do not overload `translation`.
-- This slice: **no auth** on chat, `/docs`, or `/openapi.json` (Bearer may be present and ignored).
-- Hard catalog failures (`model_not_loaded`, `route_disabled`, purpose mismatch, unsupported frontend) return OpenAI `{"error":{...}}` with **HTTP 4xx** and `X-Should-Retry: false`. openai-python auto-retries all 5xx; BabelDOC only tenacity-retries `RateLimitError`, then **falls back per-paragraph and keeps the job running** — it will not abort the whole PDF job on API errors. Do not "fix" that by returning 503.
-- Mid-flight worker death: mlxlm serializes Metal `generate` (queue concurrent BabelDOC calls); control applies catalog `restart_policy` (default `unless-stopped`) with backoff and a circuit break — Unload / `desired=unloaded` suppresses auto-restart; decision lives in control, not unix/gateway. Gateway waits/reposts for up to ~3 minutes so a single BabelDOC request (600s client timeout) can survive a crash+reload.
+- Request `model` is a **catalog id**. Gateway calls `control.GetSnapshot`, reads `purpose`, and checks `api_routes` enablement for that `(route, purpose)`.
+- **`POST /v1/chat/completions`**: purpose=`translation` only (BabelDOC / HY-MT2). `messages[].content` is a **string**. Request fields: `model`, `messages`, `temperature`, `top_p`, `max_tokens`, `stream`. `structured_translation` models on chat → `model_purpose_mismatch`.
+- **`POST /v1/translations`**: sole structured path (TranslateGemma / purpose=`structured_translation`). Document request (`source_language`, `target_language`, `context`, `glossaries`, `inputs`). Response `object=translation.batch` with `translations[].output` and `usage.input_tokens` / `output_tokens` / `total_tokens`. Gateway builds **prompt-only** JSON and calls `unix.Chat`; strips markdown fences into `translations[].output`.
+- TranslateGemma: worker uses `unix/mlx_lm/translategemma_chat_template.jinja` when `chat_template_id=translategemma` in the prompt JSON. API additives (`document_title`, `glossary`, …) are fields on the typed content part; `text` stays source-only.
+- `asr` → transcriptions (not implemented yet).
+- Serialization contracts live in control singleton tables `purpose_translation`, `purpose_structured_translation`, `purpose_asr`. Gateway reads them only via private APIs (`GetPurpose*`); it must not query the control database.
+- Do **not** hardcode sampling or message-shape rules by model id; only by `purpose` → purpose_* row. Translations apply `purpose_structured_translation` defaults server-side (no client sampling fields).
+- Sampling semantics **A** (chat/translation): omitted field → table default; explicit value `> max` → 400; `≤ max` kept. Injected `top_k` / `repetition_penalty` are applied in validate middleware and forwarded toward the worker for llama; mlxlm path goes through `unix.Chat`.
+- Chat validation runs in `gateway/validate` via `openaiValidate` middleware (`tag:openai`) on **public** APIs only. Infer path is `unix.Chat` (no middleware).
+- Frontend matrix: `translation` → llama ChatProxy (temporary) or `unix.Chat` for mlxlm; `structured_translation` → `unix.Chat` only.
+- `GET /v1/models` lists loaded **translation** models only.
+- Gateway must not invent enablement by scanning `models`; use `control.RouteEnabled(route, purpose)` / `ListEnabledRoutes`.
+- This slice: **no auth** on chat, translations, `/docs`, or `/openapi.json`.
+- Hard catalog failures return OpenAI `{"error":{...}}` with **HTTP 4xx** and `X-Should-Retry: false`.
+- Mid-flight worker death: mlxlm serializes Metal `generate`; control applies `restart_policy`. Gateway waits/reposts up to ~3 minutes for chat recovery.
 
-## Unix frontends
+## Frontends (library) + unix service
 
-`unix/` is a Go library, not an Encore service (`unix/llama`, `unix/mlxcel`, `unix/mlxlm`). Each frontend implements `unix.Runtime`. control holds them in a `FrontendKind → Runtime` map; `modelstate.AllFrontends()` is the ordered registry. Adding a backend: implement `unix.Runtime` under `unix/<kind>/`, append to `AllFrontends`, insert a `frontends` row, register in `newRuntimes`. Do not add an Encore service.
+`frontend/` is a Go library (not an Encore service): `frontend/llama`, `frontend/mlxcel`, `frontend/mlxlm`. Each implements `frontend.Runtime`. control holds them in a `FrontendKind → Runtime` map. **Only `control` may Start / Stop / Load / Unload.**
 
-Processes are started by `unix` via `os/exec`. **Only `control` may Start / Stop / Load / Unload.** `gateway` must not start a process or load a model as a side effect of inference (no implicit autoload). Launch argv must include `--no-models-autoload` and must not name a model to reside.
+`unix` Encore service dials workers only. Sock cwd: `frontend/mlxlm/{native_id}.sock`. Worker binary: `unix/mlx_lm/bin/mlx_lm_server`.
 
-`gateway` may import `unix` only as an Inferencer / dial-only forwarder (e.g. `mlxlm.ChatProxy`). It must not receive a Runtime/Start surface.
+- **mlxlm**: one-shot **JSON-over-UDS** (not HTTP). One connection = one JSON request + one JSON response. Health: `{"op":"health"}` → `{"ok":true}`. Chat response: `{"content":"...","usage":{...}}`.
+- **llama** (temporary until removed): HTTP-over-UDS; gateway still uses `llama.ChatProxy`.
 
-llama.cpp, mlxcel, and mlxlm expose **no** public web or OpenAI HTTP; they listen for internal HTTP on Unix sockets. Only `gateway` may emit OpenAI-compatible business HTTP.
-
-Socket cwd lives in `unix/llama/`, `unix/mlxcel/`, and `unix/mlxlm/` (mlxlm: one sock per model `{cwd}/{native_id}.sock`). Do not put those dirs at the repo root.
+`gateway` must not import Runtime/Start. For mlxlm inference it calls `unix.Chat` only.
 
 ## State machine
 
-`internal/modelstate` is the contract between control and gateway: control writes (applies transitions); gateway only reads snapshots. Gateway must not bypass the state machine to run management protocol.
+`internal/modelstate` is the contract between control and gateway: control writes; gateway only reads snapshots.
 
-Load requires the frontend to be `READY`. That rule lives in `modelstate` (and later control); `unix` does not implement catalog policy.
+Load requires the frontend to be `READY`. That rule lives in `modelstate` (and control); workers do not implement catalog policy.
 
-`encore run` / `initService` must not unconditionally Start llama-server or mlxcel-server. Construct runtimes, then **synchronously** reconcile `desired_state = 'loaded'` rows grouped by `frontend`. No such rows means no processes. Start a frontend only to Load a model into it. If any catalog-desired Load or frontend Start fails, drain frontends and fail `initService` so the process exits. A later gRPC `LoadModel` failure returns the error to the caller and must not exit the process.
+`encore run` / `initService` must not unconditionally Start workers. Construct runtimes, then **synchronously** reconcile `desired_state = 'loaded'` rows. No such rows means no processes.
 
-`Load` / `Unload` persist `desired_state`. On boot, observed state is reset (process is new) and reconcile follows the catalog. Unload of a frontend's last loaded model Stops that frontend. Unloading one of several models on the same frontend leaves the process running.
+Default catalog residency: **all** models `desired=unloaded`. Cold `encore run` starts no frontend workers.
 
-When the Encore app exits (`Shutdown`, including `encore run` Ctrl+C), control Unloads every model the frontends still report as loaded, then SIGTERM/SIGKILL llama-server and mlxcel-server (including instance children and a leftover process holding the Unix socket).
-
-Default catalog residency: `translategemma-12b-it-6bit` desired=loaded (mlxlm). `fun-asr-nano-2512-q8_0` and `HY-MT2-7B-Q8_0` stay desired=unloaded so llama-server is not started. The llama frontend remains in the tree for a later GGUF→MLX move.
-
-Authoritative catalog and observed model/frontend state live in the **control database**, not `config/models.yaml`. Do not read YAML on the normal path. At most two future gRPC methods: import a YAML file into the tables, export the tables to a file.
+Authoritative catalog lives in the **control database**, not `config/models.yaml`.
 
 ## Tokens and sessions
 
-Future (not this slice):
-
-- **API Token**: `sk-local-...` credential. Sessions bind to one API token.
-- **AI Token**: `prompt_tokens` / `completion_tokens` / `total_tokens` on a session step.
-
-A request that targets a session with a different API token must be rejected. Usage is two SQL views: totals per session, then totals per API token across that token's sessions.
+- **API Token** validation hook: `gateway/validate.APIToken` (no-op this slice).
+- Future: Sessions bind to one API token; **AI Token** = usage on a session step.
 
 ## Run and layout
 
-No `scripts/*.sh`. cargo-make (ninja internally) is for **compiling** llama-server / mlxcel-server later, not for starting them. Frontend processes are started through `unix` when control calls Start.
+No `scripts/*.sh`. Frontend processes start through `frontend` when control calls Start.
 
-Locally, `encore run` is enough for the Encore app. Prefer gateway `/docs` for operator-facing API try-it — not the Encore Local Dashboard (`:9400`) as the product surface. `ChatCompletions` is typed (panel forms); business errors return OpenAI `{"error":{...}}` with HTTP status set by `openaiHTTPStatus` middleware (returning `*errs.Error` would force Encore's `{code,message}` envelope).
+Prefer gateway `/docs` for operator-facing try-it. Do not restore the uptime template.
 
-Do not restore the uptime template (`slack`, `site`, `monitor`, `frontend`).
-
-`models/` is local weights only and is gitignored. Encore does not parse weight files.
-
-`/Users/nan/llm-backup` is read-only. Do not modify it.
+`models/` is local weights only and is gitignored.

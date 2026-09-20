@@ -61,6 +61,12 @@ func TestAllFrontends(t *testing.T) {
 	if modelstate.ValidFrontend("mlxaudio") {
 		t.Fatal("unknown frontend should be invalid until registered")
 	}
+	if !modelstate.SupervisorFrontend(modelstate.FrontendLlama) || !modelstate.SupervisorFrontend(modelstate.FrontendMlxlm) {
+		t.Fatal("llama and mlxlm are supervisor frontends")
+	}
+	if modelstate.SupervisorFrontend(modelstate.FrontendMlxcel) {
+		t.Fatal("mlxcel remains an engine frontend")
+	}
 }
 
 func TestNativeID(t *testing.T) {
@@ -78,5 +84,24 @@ func TestNativeID(t *testing.T) {
 		if got := modelstate.NativeID(tc.id, tc.path); got != tc.want {
 			t.Fatalf("NativeID(%q, %q) = %q, want %q", tc.id, tc.path, got, tc.want)
 		}
+	}
+}
+
+func TestValidPurpose(t *testing.T) {
+	t.Parallel()
+	if !modelstate.ValidPurpose(modelstate.PurposeASR) ||
+		!modelstate.ValidPurpose(modelstate.PurposeTranslation) ||
+		!modelstate.ValidPurpose(modelstate.PurposeStructuredTranslation) {
+		t.Fatal("seed purposes must be valid")
+	}
+	if modelstate.ValidPurpose("chat") {
+		t.Fatal("unknown purpose should be invalid")
+	}
+	if !modelstate.ChatPurpose(modelstate.PurposeTranslation) ||
+		!modelstate.ChatPurpose(modelstate.PurposeStructuredTranslation) {
+		t.Fatal("translation purposes must be chat")
+	}
+	if modelstate.ChatPurpose(modelstate.PurposeASR) {
+		t.Fatal("asr is not a chat purpose")
 	}
 }

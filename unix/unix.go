@@ -1,41 +1,94 @@
-// Package unix is the frontend runtime library for llama-server, mlxcel-server, and mlxlm.
-// It is not an Encore service.
 package unix
 
 import (
 	"context"
-	"net/http"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 
-	"encore.app/internal/modelstate"
+	"encore.dev/beta/errs"
+	"encore.dev/rlog"
 )
 
-// Model is one frontend-native model as reported by a Unix frontend.
-type Model struct {
-	ID    string
-	Path  string
-	State modelstate.ModelState
+//encore:service
+type Service struct {
+	cwd string
 }
 
-// Runtime is the control-plane surface: process + residency.
-// gateway must not depend on this interface.
-type Runtime interface {
-	Start(ctx context.Context) error
-	Stop(ctx context.Context) error
-	Ready(ctx context.Context) error
-	Load(ctx context.Context, id string) error
-	Unload(ctx context.Context, id string) error
-	Get(ctx context.Context, id string) (Model, error)
-	List(ctx context.Context) ([]Model, error)
-	EnsureReady(ctx context.Context) error
-	EnsureLoaded(ctx context.Context, id string) error
-	// ModelPID returns the OS pid for a loaded model, or an error if not found/running.
-	ModelPID(ctx context.Context, id string) (int, error)
-	// BackendPIDs returns live frontend process ids (empty if none).
-	BackendPIDs(ctx context.Context) ([]int, error)
+func initService() (*Service, error) {
+	root, err := appRoot()
+	if err != nil {
+		return nil, err
+	}
+	cwd := filepath.Join(root, "frontend", "mlxlm")
+	if err := os.MkdirAll(cwd, 0o755); err != nil {
+		return nil, err
+	}
+	abs, err := filepath.Abs(cwd)
+	if err != nil {
+		return nil, err
+	}
+	return &Service{cwd: abs}, nil
 }
 
-// Inferencer is the gateway-plane surface (chat/transcribe proxy).
-type Inferencer interface {
-	ChatCompletions(ctx context.Context, w http.ResponseWriter, req *http.Request) error
-	Transcribe(ctx context.Context, w http.ResponseWriter, req *http.Request) error
+func appRoot() (string, error) {
+	dir, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "encore.app")); err == nil {
+			return dir, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", fmt.Errorf("encore.app not found from %s", dir)
+		}
+		dir = parent
+	}
+}
+
+// ChatBody is opaque prompt JSON for the worker (Encore wraps S2S calls).
+type ChatBody struct {
+	Body json.RawMessage `json:"body"`
+}
+
+// ChatResult is the opaque worker JSON (content/usage or error).
+type ChatResult struct {
+	Body json.RawMessage `json:"body"`
+}
+
+// Chat forwards opaque prompt JSON to the mlxlm worker. No middleware; no schema.
+//
+//encore:api private method=POST path=/unix/chat/:native_id
+func (s *Service) Chat(ctx context.Context, native_id string, p *ChatBody) (*ChatResult, error) {
+	if strings.TrimSpace(native_id) == "" {
+		return nil, &errs.Error{Code: errs.InvalidArgument, Message: "model required"}
+	}
+	var body json.RawMessage
+	if p != nil {
+		body = p.Body
+	}
+	if len(strings.TrimSpace(string(body))) == 0 {
+		body = []byte("{}")
+	}
+	sock := filepath.Join(s.cwd, strings.TrimSpace(native_id)+".sock")
+	resp, err := dialJSON(ctx, sock, body)
+	if err != nil {
+		rlog.Error("unix chat dial failed", "event", "unix.chat_failed", "native_id", native_id, "err", err)
+		return nil, &errs.Error{Code: errs.Unavailable, Message: "backend unavailable"}
+	}
+	return &ChatResult{Body: json.RawMessage(resp)}, nil
+}
+
+// SocketPath is exported for tests.
+func (s *Service) SocketPath(nativeID string) string {
+	return filepath.Join(s.cwd, nativeID+".sock")
+}
+
+// DialForTest exposes dialJSON for unit tests.
+func DialForTest(ctx context.Context, socket string, body []byte) ([]byte, error) {
+	return dialJSON(ctx, socket, body)
 }

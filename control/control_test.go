@@ -9,10 +9,10 @@ import (
 
 	controlv1 "encore.app/control/proto/controlv1"
 	"encore.app/internal/modelstate"
-	"encore.app/unix"
-	"encore.app/unix/llama"
-	"encore.app/unix/mlxcel"
-	"encore.app/unix/mlxlm"
+	"encore.app/frontend"
+	"encore.app/frontend/llama"
+	"encore.app/frontend/mlxcel"
+	"encore.app/frontend/mlxlm"
 	"encore.dev/beta/errs"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -28,18 +28,26 @@ const (
 
 type testEnv struct {
 	svc        *Service
-	llamaSock  string
+	llamaCwd   string
 	mlxcelSock string
 	mlxlmSock  string // per-model sock for Gemma under mlxlm cwd
 }
 
+func (e *testEnv) llamaSock(id string) string {
+	return filepath.Join(e.llamaCwd, id+".sock")
+}
+
+func (e *testEnv) anyLlamaSock() bool {
+	return sockExists(e.llamaSock(idASR)) || sockExists(e.llamaSock(idHY))
+}
+
 func newTestEnv(t *testing.T) *testEnv {
 	t.Helper()
-	bin, err := unix.BuildFakeFrontend()
+	bin, err := frontend.BuildFakeFrontend()
 	if err != nil {
 		t.Fatal(err)
 	}
-	fakemlxBin, err := unix.BuildFakeMlxlm()
+	fakemlxBin, err := frontend.BuildFakeMlxlm()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,11 +71,10 @@ func newTestEnv(t *testing.T) *testEnv {
 	})
 	modelsDir := t.TempDir()
 	llamaRt, err := llama.NewWithConfig(llama.Config{
-		Bin:        bin,
-		Cwd:        llamaCwd,
-		SocketName: "s.sock",
-		ModelsDir:  modelsDir,
-		APIKey:     "test-key",
+		Bin:       bin,
+		Cwd:       llamaCwd,
+		ModelsDir: modelsDir,
+		APIKey:    "test-key",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -91,7 +98,7 @@ func newTestEnv(t *testing.T) *testEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc := &Service{runtimes: map[modelstate.FrontendKind]unix.Runtime{
+	svc := &Service{runtimes: map[modelstate.FrontendKind]frontend.Runtime{
 		modelstate.FrontendLlama:  llamaRt,
 		modelstate.FrontendMlxcel: mlxcelRt,
 		modelstate.FrontendMlxlm:  mlxlmRt,
@@ -112,7 +119,7 @@ func newTestEnv(t *testing.T) *testEnv {
 	})
 	return &testEnv{
 		svc:        svc,
-		llamaSock:  filepath.Join(llamaCwd, "s.sock"),
+		llamaCwd:   llamaCwd,
 		mlxcelSock: filepath.Join(mlxcelCwd, "s.sock"),
 		mlxlmSock:  filepath.Join(mlxlmCwd, idGemma+".sock"),
 	}
@@ -167,14 +174,21 @@ func TestRouteEnablementOnLoadUnload(t *testing.T) {
 	if err := env.svc.reconcile(ctx); err != nil {
 		t.Fatal(err)
 	}
-	chat, err := isRouteEnabled(ctx, "POST /v1/chat/completions")
+	chatTrans, err := isRouteEnabled(ctx, "POST /v1/chat/completions", "translation")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if chat {
-		t.Fatal("chat route should be disabled with no loaded translation model")
+	if chatTrans {
+		t.Fatal("translation chat route should be disabled with no loaded translation model")
 	}
-	asr, err := isRouteEnabled(ctx, "POST /v1/audio/transcriptions")
+	trStruct, err := isRouteEnabled(ctx, "POST /v1/translations", "structured_translation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trStruct {
+		t.Fatal("translations route should be disabled with no loaded model")
+	}
+	asr, err := isRouteEnabled(ctx, "POST /v1/audio/transcriptions", "asr")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,14 +199,21 @@ func TestRouteEnablementOnLoadUnload(t *testing.T) {
 	if _, err := env.svc.loadModel(ctx, idGemma); err != nil {
 		t.Fatal(err)
 	}
-	chat, err = isRouteEnabled(ctx, "POST /v1/chat/completions")
+	trStruct, err = isRouteEnabled(ctx, "POST /v1/translations", "structured_translation")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !chat {
-		t.Fatal("chat route should be enabled after loading Gemma")
+	if !trStruct {
+		t.Fatal("translations route should be enabled after loading Gemma")
 	}
-	asr, err = isRouteEnabled(ctx, "POST /v1/audio/transcriptions")
+	chatTrans, err = isRouteEnabled(ctx, "POST /v1/chat/completions", "translation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if chatTrans {
+		t.Fatal("translation chat route should stay disabled when only Gemma is loaded")
+	}
+	asr, err = isRouteEnabled(ctx, "POST /v1/audio/transcriptions", "asr")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,12 +224,33 @@ func TestRouteEnablementOnLoadUnload(t *testing.T) {
 	if _, err := env.svc.unloadModel(ctx, idGemma); err != nil {
 		t.Fatal(err)
 	}
-	chat, err = isRouteEnabled(ctx, "POST /v1/chat/completions")
+	trStruct, err = isRouteEnabled(ctx, "POST /v1/translations", "structured_translation")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if chat {
-		t.Fatal("chat route should disable after unload")
+	if trStruct {
+		t.Fatal("translations route should disable after unload")
+	}
+
+	if _, err := env.svc.loadModel(ctx, idHY); err != nil {
+		t.Fatal(err)
+	}
+	chatTrans, err = isRouteEnabled(ctx, "POST /v1/chat/completions", "translation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !chatTrans {
+		t.Fatal("translation chat route should be enabled after loading HY-MT2")
+	}
+	trStruct, err = isRouteEnabled(ctx, "POST /v1/translations", "structured_translation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trStruct {
+		t.Fatal("translations route should stay disabled when only HY is loaded")
+	}
+	if _, err := env.svc.unloadModel(ctx, idHY); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -219,7 +261,7 @@ func TestReconcileNoDesiredLoadedStartsNothing(t *testing.T) {
 	if err := env.svc.reconcile(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if sockExists(env.llamaSock) {
+	if env.anyLlamaSock() {
 		t.Fatal("llama sock should not exist")
 	}
 	if sockExists(env.mlxcelSock) {
@@ -237,7 +279,7 @@ func TestReconcileSeedStartsOnlyMlxlm(t *testing.T) {
 	if err := env.svc.reconcile(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if sockExists(env.llamaSock) {
+	if env.anyLlamaSock() {
 		t.Fatal("llama should not start")
 	}
 	if sockExists(env.mlxcelSock) {
@@ -274,8 +316,8 @@ func TestReconcileSeedStartsOnlyLlama(t *testing.T) {
 	if err := env.svc.reconcile(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !sockExists(env.llamaSock) {
-		t.Fatal("expected llama sock")
+	if !sockExists(env.llamaSock(idASR)) || !sockExists(env.llamaSock(idHY)) {
+		t.Fatal("expected per-model llama socks")
 	}
 	if sockExists(env.mlxcelSock) {
 		t.Fatal("mlxcel should not start")
@@ -293,6 +335,9 @@ func TestReconcileSeedStartsOnlyLlama(t *testing.T) {
 		}
 		if snap.NativeID != id {
 			t.Fatalf("%s native_id = %s", id, snap.NativeID)
+		}
+		if snap.SocketPath != nil {
+			t.Fatalf("%s socket_path should be nil for supervisor llama", id)
 		}
 	}
 	gemma, err := env.svc.lookupSnapshot(ctx, idGemma)
@@ -318,7 +363,7 @@ func TestAbortBootDrainsFrontends(t *testing.T) {
 	if sockExists(env.mlxlmSock) {
 		t.Fatal("abortBoot should stop mlxlm workers")
 	}
-	if sockExists(env.llamaSock) {
+	if env.anyLlamaSock() {
 		t.Fatal("abortBoot should not leave llama")
 	}
 }
@@ -364,14 +409,14 @@ func TestLoadAlreadyLoadedIsIdempotent(t *testing.T) {
 	if err := env.svc.reconcile(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !sockExists(env.llamaSock) {
-		t.Fatal("expected llama sock")
+	if !sockExists(env.llamaSock(idASR)) {
+		t.Fatal("expected llama asr sock")
 	}
 	if _, err := env.svc.loadModel(ctx, idASR); err != nil {
 		t.Fatal(err)
 	}
-	if !sockExists(env.llamaSock) {
-		t.Fatal("llama sock disappeared after idempotent load")
+	if !sockExists(env.llamaSock(idASR)) {
+		t.Fatal("llama asr sock disappeared after idempotent load")
 	}
 	if sockExists(env.mlxcelSock) {
 		t.Fatal("idempotent load must not start mlxcel")
@@ -409,8 +454,11 @@ func TestUnloadOneOfTwoKeepsFrontend(t *testing.T) {
 	if _, err := env.svc.unloadModel(ctx, idASR); err != nil {
 		t.Fatal(err)
 	}
-	if !sockExists(env.llamaSock) {
-		t.Fatal("llama should stay up while HY-MT2 remains loaded")
+	if sockExists(env.llamaSock(idASR)) {
+		t.Fatal("asr sock should be gone after unload")
+	}
+	if !sockExists(env.llamaSock(idHY)) {
+		t.Fatal("llama HY sock should stay up while HY-MT2 remains loaded")
 	}
 	if sockExists(env.mlxcelSock) {
 		t.Fatal("mlxcel should not start")
@@ -472,7 +520,7 @@ func TestListDoesNotStartFrontend(t *testing.T) {
 	if len(snaps) < 3 {
 		t.Fatalf("catalog len = %d", len(snaps))
 	}
-	if sockExists(env.llamaSock) || sockExists(env.mlxcelSock) || sockExists(env.mlxlmSock) {
+	if env.anyLlamaSock() || sockExists(env.mlxcelSock) || sockExists(env.mlxlmSock) {
 		t.Fatal("list must not start a frontend")
 	}
 }
@@ -559,14 +607,14 @@ func TestShutdownUnloadsAndStops(t *testing.T) {
 	if err := env.svc.reconcile(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !sockExists(env.llamaSock) {
-		t.Fatal("expected llama sock")
+	if !sockExists(env.llamaSock(idASR)) || !sockExists(env.llamaSock(idHY)) {
+		t.Fatal("expected per-model llama socks")
 	}
 	force, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	env.svc.Shutdown(force)
-	if sockExists(env.llamaSock) {
-		t.Fatal("llama sock should be gone after shutdown")
+	if env.anyLlamaSock() {
+		t.Fatal("llama socks should be gone after shutdown")
 	}
 	if sockExists(env.mlxcelSock) {
 		t.Fatal("mlxcel sock should be gone after shutdown")
@@ -584,18 +632,18 @@ func (f *failLoadRT) Start(context.Context) error { f.started = true; return nil
 func (f *failLoadRT) Stop(context.Context) error  { f.started = false; return nil }
 func (f *failLoadRT) Ready(context.Context) error {
 	if !f.started {
-		return unix.ErrNotReady
+		return frontend.ErrNotReady
 	}
 	return nil
 }
 func (f *failLoadRT) Load(context.Context, string) error {
-	return &unix.Error{Code: unix.CodeLoadFailed, Message: "weight not found"}
+	return &frontend.Error{Code: frontend.CodeLoadFailed, Message: "weight not found"}
 }
 func (f *failLoadRT) Unload(context.Context, string) error { return nil }
-func (f *failLoadRT) Get(context.Context, string) (unix.Model, error) {
-	return unix.Model{}, unix.ErrNotReady
+func (f *failLoadRT) Get(context.Context, string) (frontend.Model, error) {
+	return frontend.Model{}, frontend.ErrNotReady
 }
-func (f *failLoadRT) List(context.Context) ([]unix.Model, error) { return nil, nil }
+func (f *failLoadRT) List(context.Context) ([]frontend.Model, error) { return nil, nil }
 func (f *failLoadRT) EnsureReady(ctx context.Context) error      { return f.Start(ctx) }
 func (f *failLoadRT) EnsureLoaded(ctx context.Context, id string) error {
 	if err := f.EnsureReady(ctx); err != nil {
@@ -604,11 +652,11 @@ func (f *failLoadRT) EnsureLoaded(ctx context.Context, id string) error {
 	return f.Load(ctx, id)
 }
 func (f *failLoadRT) ModelPID(context.Context, string) (int, error) {
-	return 0, unix.ErrNotReady
+	return 0, frontend.ErrNotReady
 }
 func (f *failLoadRT) BackendPIDs(context.Context) ([]int, error) { return nil, nil }
 
-var _ unix.Runtime = (*failLoadRT)(nil)
+var _ frontend.Runtime = (*failLoadRT)(nil)
 
 func dialGRPC(t *testing.T, addr string) *grpc.ClientConn {
 	t.Helper()

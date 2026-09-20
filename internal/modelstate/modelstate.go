@@ -56,12 +56,19 @@ func AllFrontends() []FrontendKind {
 	return []FrontendKind{FrontendLlama, FrontendMlxcel, FrontendMlxlm}
 }
 
+// SupervisorFrontend reports whether kind uses one OS process per loaded model
+// (Start is a ready flag only; Load spawns the worker).
+func SupervisorFrontend(k FrontendKind) bool {
+	return k == FrontendLlama || k == FrontendMlxlm
+}
+
 // Purpose is which OpenAI route a model may serve.
 type Purpose string
 
 const (
-	PurposeASR         Purpose = "asr"
-	PurposeTranslation Purpose = "translation"
+	PurposeASR                   Purpose = "asr"
+	PurposeTranslation           Purpose = "translation"
+	PurposeStructuredTranslation Purpose = "structured_translation"
 )
 
 // ModelSnapshot is the read-only view gateway may use.
@@ -113,7 +120,12 @@ func ValidFrontend(k FrontendKind) bool {
 
 // ValidPurpose reports whether p is a known catalog purpose.
 func ValidPurpose(p Purpose) bool {
-	return p == PurposeASR || p == PurposeTranslation
+	return p == PurposeASR || p == PurposeTranslation || p == PurposeStructuredTranslation
+}
+
+// ChatPurpose reports whether p may be served by POST /v1/chat/completions.
+func ChatPurpose(p Purpose) bool {
+	return p == PurposeTranslation || p == PurposeStructuredTranslation
 }
 
 // FrontendSnapshot is the read-only view of a Unix frontend.

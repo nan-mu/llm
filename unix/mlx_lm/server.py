@@ -1,4 +1,4 @@
-"""Thin single-model mlx-lm HTTP server over a Unix domain socket."""
+"""Thin single-model mlx-lm JSON-over-UDS server (one connection = one request)."""
 
 from __future__ import annotations
 
@@ -6,23 +6,19 @@ import argparse
 import json
 import os
 import signal
+import socket
 import sys
 import threading
-import time
-import uuid
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from socketserver import UnixStreamServer
+from pathlib import Path
 from typing import Any
 
 
-class UnixHTTPServer(ThreadingHTTPServer, UnixStreamServer):
-    address_family = UnixStreamServer.address_family
-
-
-# MLX Metal is not safe for concurrent eval on one loaded model. Accept many
-# HTTP connections, but run generate one-at-a-time so BabelDOC parallelism
-# queues instead of SIGSEGV inside libmlx.
+# MLX Metal is not safe for concurrent eval on one loaded model.
 _infer_lock = threading.Lock()
+
+_TRANSLATEGEMMA_TEMPLATE = Path(__file__).with_name("translategemma_chat_template.jinja").read_text(
+    encoding="utf-8"
+)
 
 
 def load_model(path: str):
@@ -32,146 +28,154 @@ def load_model(path: str):
     return model, tokenizer
 
 
-def apply_chat_template(tokenizer, messages: list[dict[str, str]]) -> str:
+def apply_chat_template(tokenizer, messages: list[dict[str, Any]], *, structured: bool = False) -> str:
     if hasattr(tokenizer, "apply_chat_template"):
         try:
-            return tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
+            kwargs: dict[str, Any] = {
+                "tokenize": False,
+                "add_generation_prompt": True,
+            }
+            if structured:
+                kwargs["chat_template"] = _TRANSLATEGEMMA_TEMPLATE
+            return tokenizer.apply_chat_template(messages, **kwargs)
         except Exception:
-            pass
+            if structured:
+                raise
+    if structured:
+        raise ValueError("translategemma chat template required but apply_chat_template failed")
     parts: list[str] = []
     for m in messages:
         role = m.get("role", "user")
         content = m.get("content", "")
+        if not isinstance(content, str):
+            content = json.dumps(content, ensure_ascii=False)
         parts.append(f"{role}: {content}")
     parts.append("assistant:")
     return "\n".join(parts)
 
 
-def generate_reply(model, tokenizer, messages: list[dict[str, str]], max_tokens: int) -> str:
+def generate_reply(
+    model,
+    tokenizer,
+    messages: list[dict[str, Any]],
+    max_tokens: int,
+    *,
+    structured: bool = False,
+) -> tuple[str, dict[str, int]]:
     from mlx_lm import generate
 
-    prompt = apply_chat_template(tokenizer, messages)
+    prompt = apply_chat_template(tokenizer, messages, structured=structured)
+    prompt_tokens = count_tokens(tokenizer, prompt)
     waited = not _infer_lock.acquire(blocking=False)
     if waited:
         sys.stderr.write("mlx_lm_server: infer lock busy, queuing generate\n")
         _infer_lock.acquire()
     try:
-        return generate(model, tokenizer, prompt=prompt, max_tokens=max_tokens)
+        text = generate(model, tokenizer, prompt=prompt, max_tokens=max_tokens)
     finally:
         _infer_lock.release()
+    completion_tokens = count_tokens(tokenizer, text, add_special_tokens=False)
+    usage = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+    return text, usage
 
 
-def make_handler(api_key: str | None, model, tokenizer, model_id: str):
-    class Handler(BaseHTTPRequestHandler):
-        def address_string(self) -> str:
-            # On AF_UNIX, client_address is a string path (or empty), not (host, port).
-            addr = self.client_address
-            if isinstance(addr, str):
-                return addr or "unix"
-            if isinstance(addr, tuple) and addr:
-                return str(addr[0])
-            return "unix"
+def count_tokens(tokenizer, text: str, *, add_special_tokens: bool = True) -> int:
+    if text is None:
+        return 0
+    s = text if isinstance(text, str) else str(text)
+    if not s:
+        return 0
+    try:
+        if hasattr(tokenizer, "encode"):
+            ids = tokenizer.encode(s, add_special_tokens=add_special_tokens)
+            return len(ids)
+    except TypeError:
+        try:
+            ids = tokenizer.encode(s)
+            return len(ids)
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        out = tokenizer(s, add_special_tokens=add_special_tokens)
+        ids = out["input_ids"] if isinstance(out, dict) else out.input_ids
+        return len(ids)
+    except Exception:  # noqa: BLE001
+        return 0
 
-        def log_message(self, fmt: str, *args) -> None:  # noqa: A003
-            sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
 
-        def _check_auth(self) -> bool:
-            if not api_key:
-                return True
-            auth = self.headers.get("Authorization", "")
-            expected = "Bearer " + api_key
-            if auth != expected:
-                self._json(401, {"error": {"message": "invalid api key", "type": "invalid_request_error"}})
-                return False
-            return True
+def _messages_have_image(messages: list[dict[str, Any]]) -> bool:
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "image":
+                    return True
+    return False
 
-        def _json(self, status: int, body: Any) -> None:
-            raw = json.dumps(body).encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(raw)))
-            # Hard failures must not be retried by openai-python (retries all 5xx).
-            if status >= 400:
-                self.send_header("X-Should-Retry", "false")
-            self.end_headers()
-            self.wfile.write(raw)
 
-        def _read_json(self) -> dict[str, Any] | None:
-            length = int(self.headers.get("Content-Length", "0") or "0")
-            raw = self.rfile.read(length) if length > 0 else b"{}"
-            try:
-                return json.loads(raw.decode("utf-8") or "{}")
-            except json.JSONDecodeError:
-                self._json(400, {"error": {"message": "invalid json", "type": "invalid_request_error"}})
-                return None
+def handle_request(body: dict[str, Any], model, tokenizer) -> dict[str, Any]:
+    op = (body.get("op") or "").strip()
+    if op == "health" or body.get("ping") is True:
+        return {"ok": True}
 
-        def do_GET(self) -> None:  # noqa: N802
-            if self.path.split("?", 1)[0] != "/health":
-                self.send_response(404)
-                self.end_headers()
-                return
-            # Health is unauthenticated so supervisors can poll before auth wiring.
-            self.send_response(200)
-            self.end_headers()
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return {"error": {"message": "messages required", "type": "invalid_request_error"}}
+    if body.get("stream"):
+        return {"error": {"message": "streaming not supported", "type": "invalid_request_error"}}
 
-        def do_POST(self) -> None:  # noqa: N802
-            path = self.path.split("?", 1)[0]
-            if path != "/v1/chat/completions":
-                self.send_response(404)
-                self.end_headers()
-                return
-            if not self._check_auth():
-                return
-            body = self._read_json()
-            if body is None:
-                return
-            messages = body.get("messages")
-            if not isinstance(messages, list) or not messages:
-                self._json(400, {"error": {"message": "messages required", "type": "invalid_request_error"}})
-                return
-            if body.get("stream"):
-                self._json(400, {"error": {"message": "streaming not supported", "type": "invalid_request_error"}})
-                return
-            max_tokens = int(body.get("max_tokens") or 2048)
-            req_model = body.get("model") or model_id
+    max_tokens = int(body.get("max_tokens") or 2048)
+    template_id = str(body.get("chat_template_id") or "").strip()
+    structured = template_id == "translategemma"
 
-            if model is None or tokenizer is None:
-                content = "fakemlx-ok"
-            else:
-                try:
-                    content = generate_reply(model, tokenizer, messages, max_tokens)
-                except Exception as exc:  # noqa: BLE001
-                    self._json(
-                        500,
-                        {"error": {"message": str(exc), "type": "server_error"}},
-                    )
-                    return
+    if structured and _messages_have_image(messages):
+        return {"error": {"message": "image content not supported yet", "type": "invalid_request_error"}}
 
-            resp = {
-                "id": "chatcmpl-" + uuid.uuid4().hex[:24],
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": req_model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": content},
-                        "finish_reason": "stop",
-                    }
-                ],
-                "usage": {
-                    "prompt_tokens": 0,
-                    "completion_tokens": 0,
-                    "total_tokens": 0,
-                },
-            }
-            self._json(200, resp)
+    if model is None or tokenizer is None:
+        content = "fakemlx-ok"
+        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    else:
+        try:
+            raw_content, usage = generate_reply(
+                model, tokenizer, messages, max_tokens, structured=structured
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"error": {"message": str(exc), "type": "server_error"}}
+        content = raw_content if isinstance(raw_content, str) else str(raw_content)
 
-    return Handler
+    return {"content": content, "usage": usage}
+
+
+def serve_conn(conn: socket.socket, model, tokenizer) -> None:
+    try:
+        chunks: list[bytes] = []
+        while True:
+            buf = conn.recv(65536)
+            if not buf:
+                break
+            chunks.append(buf)
+        raw = b"".join(chunks)
+        try:
+            body = json.loads(raw.decode("utf-8") or "{}")
+            if not isinstance(body, dict):
+                raise ValueError("request must be a JSON object")
+        except (json.JSONDecodeError, ValueError) as exc:
+            resp = {"error": {"message": f"invalid json: {exc}", "type": "invalid_request_error"}}
+        else:
+            resp = handle_request(body, model, tokenizer)
+        out = json.dumps(resp, ensure_ascii=False).encode("utf-8")
+        conn.sendall(out)
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
 
 
 def watch_parent(parent_pid: int, stop: threading.Event) -> None:
@@ -186,21 +190,12 @@ def watch_parent(parent_pid: int, stop: threading.Event) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="mlx-lm single-model UDS server")
+    parser = argparse.ArgumentParser(description="mlx-lm single-model JSON UDS server")
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--host", required=True, help="Unix socket path")
-    parser.add_argument("--api-key", default="")
-    parser.add_argument(
-        "--parent-pid",
-        type=int,
-        default=0,
-        help="Exit when this PID disappears (Go supervisor)",
-    )
-    parser.add_argument(
-        "--skip-load",
-        action="store_true",
-        help="Skip mlx_lm.load (health/chat stub for smoke / orphan tests)",
-    )
+    parser.add_argument("--api-key", default="", help="ignored (UDS trust); kept for argv compat")
+    parser.add_argument("--parent-pid", type=int, default=0)
+    parser.add_argument("--skip-load", action="store_true")
     args = parser.parse_args()
 
     model_path = os.path.abspath(args.model_path)
@@ -210,7 +205,6 @@ def main() -> int:
 
     model = None
     tokenizer = None
-    model_id = os.path.basename(model_path.rstrip("/"))
     skip = args.skip_load or os.environ.get("MLXLM_SKIP_LOAD", "").strip() in ("1", "true", "yes")
     if not skip:
         if not os.path.isdir(model_path):
@@ -228,8 +222,10 @@ def main() -> int:
         pass
     os.makedirs(os.path.dirname(host) or ".", exist_ok=True)
 
-    api_key = args.api_key.strip() or None
-    server = UnixHTTPServer(host, make_handler(api_key, model, tokenizer, model_id))
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(host)
+    srv.listen(64)
+    srv.settimeout(1.0)
 
     stop = threading.Event()
     parent_pid = args.parent_pid or os.getppid()
@@ -238,17 +234,28 @@ def main() -> int:
     def handle_signal(signum, _frame):
         sys.stderr.write(f"mlx_lm_server: signal {signum}, shutting down\n")
         stop.set()
-        threading.Thread(target=server.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
-    sys.stderr.write(f"mlx_lm_server: listening on {host} (parent-pid={parent_pid})\n")
+    sys.stderr.write(f"mlx_lm_server: listening on {host} (parent-pid={parent_pid}, proto=json)\n")
     try:
-        server.serve_forever()
+        while not stop.is_set():
+            try:
+                conn, _ = srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                if stop.is_set():
+                    break
+                raise
+            threading.Thread(target=serve_conn, args=(conn, model, tokenizer), daemon=True).start()
     finally:
         stop.set()
-        server.server_close()
+        try:
+            srv.close()
+        except OSError:
+            pass
         try:
             os.unlink(host)
         except FileNotFoundError:

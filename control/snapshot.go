@@ -110,7 +110,7 @@ func (s *Service) lookupBackend(ctx context.Context, kind string) (*BackendSnaps
 }
 
 func (s *Service) backendSnapshot(ctx context.Context, row frontendRow) BackendSnapshot {
-	// ready follows catalog observed_state, not merely unix.Ready (mlxlm is
+	// ready follows catalog observed_state, not merely frontend.Ready (mlxlm is
 	// Ready after Start with zero workers — that must not look ready in Health).
 	ready := row.Observed == modelstate.FrontendReady
 	return BackendSnapshot{
@@ -137,7 +137,7 @@ type BackendSnapshot struct {
 
 func (row modelRow) snapshot() *Snapshot {
 	sock := row.SocketPath
-	if row.Frontend == modelstate.FrontendMlxlm {
+	if modelstate.SupervisorFrontend(row.Frontend) {
 		sock = nil
 	}
 	snap := &Snapshot{

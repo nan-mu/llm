@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"encore.app/internal/modelstate"
-	"encore.app/unix"
+	"encore.app/frontend"
 	"encore.dev/rlog"
 )
 
@@ -237,7 +237,7 @@ func (s *Service) unloadLocked(ctx context.Context, id string, stopIfIdle bool) 
 		}
 		unloadCtx, cancel := withTimeout(ctx, loadTimeout)
 		defer cancel()
-		if err := rt.Unload(unloadCtx, row.NativeID); err != nil && !unix.Is(err, unix.CodeNotFound) {
+		if err := rt.Unload(unloadCtx, row.NativeID); err != nil && !frontend.Is(err, frontend.CodeNotFound) {
 			_ = setModelObserved(ctx, id, modelstate.ModelFailed, err.Error())
 			recordEvent(ctx, id, eventUnloadFailed, map[string]string{"error": err.Error()})
 			return nil, err
@@ -273,8 +273,8 @@ func (s *Service) ensureFrontendLocked(ctx context.Context, kind modelstate.Fron
 		return fmt.Errorf("no runtime for frontend %s", kind)
 	}
 	if err := rt.Ready(ctx); err == nil {
-		// mlxlm Start is a no-op supervisor: stay loading until a model finishes Load.
-		if kind == modelstate.FrontendMlxlm {
+		// Supervisor Start is a no-op ready flag: stay loading until a model finishes Load.
+		if modelstate.SupervisorFrontend(kind) {
 			return setFrontendObserved(ctx, kind, modelstate.FrontendLoading, "")
 		}
 		return setFrontendObserved(ctx, kind, modelstate.FrontendReady, "")
@@ -301,7 +301,7 @@ func (s *Service) ensureFrontendLocked(ctx context.Context, kind modelstate.Fron
 		return err
 	}
 	afterStart := modelstate.FrontendReady
-	if kind == modelstate.FrontendMlxlm {
+	if modelstate.SupervisorFrontend(kind) {
 		afterStart = modelstate.FrontendLoading
 	}
 	if err := setFrontendObserved(ctx, kind, afterStart, ""); err != nil {
