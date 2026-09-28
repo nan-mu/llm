@@ -49,7 +49,7 @@ Load requires the frontend to be `READY`. That rule lives in `modelstate` (and c
 
 `encore run` / `initService` must not unconditionally Start workers. Construct runtimes, then **synchronously** reconcile `desired_state = 'loaded'` rows. No such rows means no processes.
 
-Default catalog residency: **all** models `desired=unloaded`. Cold `encore run` starts no frontend workers.
+Default catalog residency: TranslateGemma (`translategemma-12b-it-6bit`) `desired=loaded`; others `unloaded`. Cold `encore run` reconciles that row and starts mlxlm.
 
 Authoritative catalog lives in the **control database**, not `config/models.yaml`.
 
