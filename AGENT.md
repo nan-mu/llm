@@ -24,7 +24,7 @@ Do not introduce services named `dataplane`, `identity`, `openai`, or `inference
 - Sampling semantics **A** (chat/translation): omitted field → table default; explicit value `> max` → 400; `≤ max` kept. Injected `top_k` / `repetition_penalty` are applied in validate middleware and forwarded toward the worker for llama; mlxlm path goes through `unix.Chat`.
 - Chat validation runs in `gateway/validate` via `openaiValidate` middleware (`tag:openai`) on **public** APIs only. Infer path is `unix.Chat` (no middleware).
 - Frontend matrix: `translation` → llama ChatProxy (temporary) or `unix.Chat` for mlxlm; `structured_translation` → `unix.Chat` only.
-- `GET /v1/models` lists loaded **translation** models only.
+- `GET /v1/models` lists loaded **translation** and **structured_translation** models (not ASR).
 - Gateway must not invent enablement by scanning `models`; use `control.RouteEnabled(route, purpose)` / `ListEnabledRoutes`.
 - This slice: **no auth** on chat, translations, `/docs`, or `/openapi.json`.
 - Hard catalog failures return OpenAI `{"error":{...}}` with **HTTP 4xx** and `X-Should-Retry: false`.

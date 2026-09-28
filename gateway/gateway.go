@@ -391,7 +391,8 @@ type ModelEntry struct {
 	OwnedBy string `json:"owned_by"`
 }
 
-// ListModels lists loaded translation models (BabelDOC / HY-MT2). Not Gemma.
+// ListModels lists loaded translation and structured_translation models
+// (BabelDOC / HY-MT2 / TranslateGemma). ASR is omitted.
 //
 //encore:api public method=GET path=/v1/models
 func (s *Service) ListModels(ctx context.Context) (*ListModelsResponse, error) {
@@ -401,7 +402,9 @@ func (s *Service) ListModels(ctx context.Context) (*ListModelsResponse, error) {
 	}
 	out := &ListModelsResponse{Object: "list", Data: []ModelEntry{}}
 	for _, m := range all.Models {
-		if m.Purpose != string(modelstate.PurposeTranslation) {
+		purpose := modelstate.Purpose(m.Purpose)
+		if purpose != modelstate.PurposeTranslation &&
+			purpose != modelstate.PurposeStructuredTranslation {
 			continue
 		}
 		if m.Observed != string(modelstate.ModelLoaded) {

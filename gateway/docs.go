@@ -292,7 +292,7 @@ func buildOpenAPI(chatEnabled, translationsEnabled bool) map[string]any {
 			"get": map[string]any{
 				"operationId": "listModels",
 				"summary":     "List Models",
-				"description": "Loaded purpose=translation models only (BabelDOC). Structured models are not listed here; see /control/routes and POST /v1/translations.",
+				"description": "Loaded purpose=translation and structured_translation models (BabelDOC / HY-MT2 / TranslateGemma). ASR is omitted.",
 				"deprecated":  !chatEnabled,
 				"responses": map[string]any{
 					"200": map[string]any{
