@@ -4,25 +4,17 @@ Stable architecture decisions for this Encore app. Do not treat this as an end-u
 
 ## Services
 
-Five Encore services:
+Three Encore services:
 
 - `gateway` — sole **OpenAI-compatible** HTTP surface (`POST /v1/chat/completions`, `POST /v1/translations`, `GET /v1/models`, plus `/docs` and `/openapi.json`). Future: API tokens, sessions, usage.
 - `control` — model catalog, observed residency/frontend state, frontend management. Load/Unload are in-process calls on the `frontend` library. This tree has no gRPC server. Narrow public HTTP only: `/control/health`, `/control/routes`. Do not expose Load/Unload, sockets, or secrets via those pages.
 - `unix` — private infer router only (`POST /unix/chat/:native_id`). Opaque prompt JSON in / out (`body` field for Encore S2S). **No middleware.** Dials mlxlm JSON-over-UDS. Does not Start/Load models.
-- `zotero` — public Zotero-plugin HTTP contract (`/v1/health`, `/v1/documents*`). **No auth** this slice (same as gateway). Delegates persistence/translation to `babeldoc`. No gRPC.
-- `babeldoc` — private PDF translation tasks: owns the `babeldoc` Postgres DB (source/dual PDF as BYTEA) and Pub/Sub topic `babeldoc-translate`. Internal APIs under `/babeldoc/*` only. This tree does not start a `pixi` / `babeldoc` worker and does not create `/tmp` work dirs.
 
-Do not introduce services named `dataplane`, `identity`, `openai`, or `inference`.
+Zotero and BabelDOC do not belong in this app. The Zotero plugin HTTP contract, PDF task storage, and the BabelDOC worker live in a separate backend. Do not add those services, that database, or that Pub/Sub topic here.
+
+Do not introduce services named `dataplane`, `identity`, `openai`, `inference`, `zotero`, or `babeldoc`.
 
 Service-to-service calls use Encore `//encore:api private` (typed Go imports). Do not add new gRPC for internal APIs.
-
-## Zotero / BabelDOC
-
-- Task id = SHA-256 of source PDF bytes (64 lowercase hex). Statuses: `pending`, `down`, `error`.
-- Work files under `BABELDOC_WORK_ROOT` (default `/tmp/babeldoc-{hash}`); BabelDOC root default `/Users/nan/BabelDOC` via `BABELDOC_ROOT`.
-- Dual PDF only (`--no-mono`); BabelDOC config points structure-api at gateway `:4000/v1`.
-- Auth / OpenBao: deferred; next stage after this feature.
-- This tree keeps the task API, database, and `babeldoc-translate` topic. It does not shell out to `babeldoc` or `pixi`, and it does not vendor BabelDOC. A published event is acknowledged by a stub subscription.
 
 ## OpenAI routing (this slice)
 
@@ -68,7 +60,6 @@ Authoritative catalog lives in the **control database**, not `config/models.yaml
 ## Tokens and sessions
 
 - **API Token** validation hook: `gateway/validate.APIToken` (no-op this slice).
-- `zotero` public routes: **no auth** this slice (Bearer ignored if present).
 - Future: API tokens + OpenBao (including production DB connection material); Sessions bind to one API token; **AI Token** = usage on a session step.
 
 ## Run and layout

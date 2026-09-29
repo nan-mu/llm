@@ -81,7 +81,7 @@ func buildOpenAPI(chatEnabled, translationsEnabled bool) map[string]any {
 		"info": map[string]any{
 			"title":       "llm",
 			"version":     "0.1.0",
-			"description": "Public HTTP surface. BabelDOC worker execution is not wired. Private Encore APIs are omitted here.",
+			"description": "Public HTTP surface for the local inference gateway. Private Encore APIs are omitted here.",
 		},
 		"paths": map[string]any{
 			"/health": map[string]any{
@@ -107,56 +107,6 @@ func buildOpenAPI(chatEnabled, translationsEnabled bool) map[string]any {
 					"400": jsonResp("TranslationsResponse", "Catalog or validation failure. X-Should-Retry: false."),
 					"404": jsonResp("TranslationsResponse", "Unknown model."),
 				}),
-			},
-			"/v1/health": map[string]any{
-				"get": op("Zotero health", "Zotero facade health. No auth in this slice.", "", map[string]any{
-					"200": jsonResp("Health", "Facade is up."),
-				}),
-			},
-			"/v1/documents": map[string]any{
-				"get": op("List documents", "Full translation task list. Statuses: pending, down, error.", "", map[string]any{
-					"200": jsonResp("DocumentList", "Tasks."),
-				}),
-				"post": map[string]any{
-					"summary":     "Submit document",
-					"description": "Raw application/pdf body. Optional X-Document-SHA256 must be 64 lowercase hex and match the bytes. Task id is the SHA-256 of the PDF. Does not run a PDF worker.",
-					"requestBody": map[string]any{
-						"required": true,
-						"content": map[string]any{
-							"application/pdf": map[string]any{"schema": map[string]any{"type": "string", "format": "binary"}},
-						},
-					},
-					"responses": map[string]any{
-						"202": jsonResp("DocumentRef", "Task created (pending)."),
-						"200": jsonResp("DocumentRef", "Task already exists."),
-						"400": jsonResp("APIError", "Invalid PDF or hash."),
-					},
-				},
-			},
-			"/v1/documents/{hash}": map[string]any{
-				"delete": withParams(op("Delete document", "Idempotent task cleanup.", "", map[string]any{
-					"200": jsonResp("Ack", "Deleted or already absent."),
-					"400": jsonResp("APIError", "Hash is not 64 lowercase hex."),
-				}), hashParam()),
-			},
-			"/v1/documents/{hash}/files/dual": map[string]any{
-				"get": map[string]any{
-					"summary":     "Download dual PDF",
-					"description": "Bilingual PDF when status is down. Sets X-Artifact-SHA256.",
-					"parameters":  []any{hashParam()},
-					"responses": map[string]any{
-						"200": map[string]any{"description": "PDF bytes.", "content": map[string]any{"application/pdf": map[string]any{"schema": map[string]any{"type": "string", "format": "binary"}}}},
-						"404": jsonResp("APIError", "Unknown task."),
-						"409": jsonResp("APIError", "Task is not down."),
-					},
-				},
-			},
-			"/v1/documents/{hash}/retry": map[string]any{
-				"post": withParams(op("Retry document", "Re-queues an error task. pending and down are idempotent. Does not run a PDF worker.", "", map[string]any{
-					"202": jsonResp("DocumentRef", "Re-queued."),
-					"200": jsonResp("DocumentRef", "Already pending or down."),
-					"404": jsonResp("APIError", "Unknown task."),
-				}), hashParam()),
 			},
 			"/control/health": map[string]any{
 				"get": op("Control health", "Control plane and catalog database are up.", "", map[string]any{
@@ -226,20 +176,6 @@ func buildOpenAPI(chatEnabled, translationsEnabled bool) map[string]any {
 					"object": map[string]any{"type": "string"},
 					"data":   map[string]any{"type": "array", "items": map[string]any{"type": "object"}},
 				}},
-				"DocumentRef": map[string]any{"type": "object", "properties": map[string]any{
-					"id":     map[string]any{"type": "string"},
-					"status": map[string]any{"type": "string", "enum": []string{"pending", "down", "error"}},
-				}},
-				"DocumentList": map[string]any{"type": "object", "properties": map[string]any{
-					"documents": map[string]any{"type": "array", "items": map[string]any{"$ref": "#/components/schemas/DocumentRef"}},
-				}},
-				"Ack": map[string]any{"type": "object", "properties": map[string]any{"ack": map[string]any{"type": "boolean"}}},
-				"APIError": map[string]any{"type": "object", "properties": map[string]any{
-					"error": map[string]any{"type": "object", "properties": map[string]any{
-						"code":    map[string]any{"type": "string"},
-						"message": map[string]any{"type": "string"},
-					}},
-				}},
 				"RouteList": map[string]any{"type": "object", "properties": map[string]any{
 					"routes": map[string]any{"type": "array", "items": map[string]any{"type": "object", "properties": map[string]any{
 						"route":   map[string]any{"type": "string"},
@@ -269,20 +205,6 @@ func op(summary, description, requestSchema string, responses map[string]any) ma
 		}
 	}
 	return out
-}
-
-func withParams(op map[string]any, params ...any) map[string]any {
-	op["parameters"] = params
-	return op
-}
-
-func hashParam() map[string]any {
-	return map[string]any{
-		"name":     "hash",
-		"in":       "path",
-		"required": true,
-		"schema":   map[string]any{"type": "string", "pattern": "^[0-9a-f]{64}$"},
-	}
 }
 
 func jsonResp(schema, description string) map[string]any {
