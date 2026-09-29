@@ -1,0 +1,12 @@
+{
+    "mcpServers": {
+        "encore-local": {
+            "args": [
+                "mcp",
+                "run",
+                "--app=3g278"
+            ],
+            "command": "encore"
+        }
+    }
+}

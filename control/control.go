@@ -2,9 +2,11 @@ package control
 
 import (
 	"context"
+	"errors"
 	"net"
 	"os"
 	"sync"
+	"syscall"
 	"time"
 
 	"encore.app/internal/modelstate"
@@ -23,6 +25,10 @@ import (
 const (
 	grpcAddr         = "127.0.0.1:9000"
 	bootDrainTimeout = 30 * time.Second
+	// Hot-reload / service restart can call initService before the previous
+	// instance has released :9000. Retry long enough for Shutdown's Stop().
+	grpcListenRetries = 40
+	grpcListenBackoff = 250 * time.Millisecond
 )
 
 //encore:service
@@ -79,9 +85,7 @@ func (s *Service) abortBoot(err error) {
 	drainCtx, cancel := context.WithTimeout(context.Background(), bootDrainTimeout)
 	defer cancel()
 	s.drainFrontends(drainCtx)
-	if s.grpcSrv != nil {
-		s.grpcSrv.Stop()
-	}
+	s.stopGRPC()
 	if s.cancel != nil {
 		s.cancel()
 	}
@@ -94,19 +98,23 @@ func (s *Service) Shutdown(force context.Context) {
 	if s.cancel != nil {
 		s.cancel()
 	}
-	if s.grpcSrv != nil {
-		done := make(chan struct{})
-		go func() {
-			s.grpcSrv.GracefulStop()
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-force.Done():
-			s.grpcSrv.Stop()
-		}
-	}
+	// Release :9000 immediately. GracefulStop waits on in-flight RPCs and races
+	// hot-reload initService (EADDRINUSE → fatal → kills mid-flight workers).
+	s.stopGRPC()
 	s.drainFrontends(force)
+}
+
+func (s *Service) stopGRPC() {
+	srv := s.grpcSrv
+	ln := s.grpcLn
+	s.grpcSrv = nil
+	s.grpcLn = nil
+	if srv != nil {
+		srv.Stop()
+	}
+	if ln != nil {
+		_ = ln.Close()
+	}
 }
 
 func (s *Service) drainFrontends(ctx context.Context) {
@@ -213,17 +221,18 @@ func (s *Service) runtime(kind modelstate.FrontendKind) frontend.Runtime {
 }
 
 func (s *Service) serveGRPC(addr string) error {
-	ln, err := net.Listen("tcp", addr)
+	ln, err := listenTCPRetry(addr, grpcListenRetries, grpcListenBackoff)
 	if err != nil {
 		return err
 	}
+	srv := grpc.NewServer()
 	s.grpcLn = ln
-	s.grpcSrv = grpc.NewServer()
+	s.grpcSrv = srv
 	api := &grpcAPI{svc: s}
-	controlv1.RegisterModelControlServer(s.grpcSrv, api)
-	controlv1.RegisterBackendControlServer(s.grpcSrv, api)
+	controlv1.RegisterModelControlServer(srv, api)
+	controlv1.RegisterBackendControlServer(srv, api)
 	go func() {
-		if err := s.grpcSrv.Serve(ln); err != nil && err != grpc.ErrServerStopped {
+		if err := srv.Serve(ln); err != nil && err != grpc.ErrServerStopped {
 			rlog.Error("grpc server stopped",
 				"event", "control.grpc_stopped",
 				"err", err,
@@ -231,6 +240,49 @@ func (s *Service) serveGRPC(addr string) error {
 		}
 	}()
 	return nil
+}
+
+func listenTCPRetry(addr string, retries int, backoff time.Duration) (net.Listener, error) {
+	if retries < 1 {
+		retries = 1
+	}
+	var last error
+	for attempt := 0; attempt < retries; attempt++ {
+		ln, err := net.Listen("tcp", addr)
+		if err == nil {
+			return ln, nil
+		}
+		last = err
+		if !isAddrInUse(err) {
+			return nil, err
+		}
+		if attempt == 0 {
+			rlog.Warn("grpc listen address in use; retrying",
+				"event", "control.grpc_listen_busy",
+				"addr", addr,
+				"err", err,
+			)
+		}
+		if attempt+1 == retries {
+			break
+		}
+		time.Sleep(backoff)
+	}
+	return nil, last
+}
+
+func isAddrInUse(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.EADDRINUSE) {
+		return true
+	}
+	var op *net.OpError
+	if errors.As(err, &op) {
+		return isAddrInUse(op.Err)
+	}
+	return false
 }
 
 func newRuntimes() (map[modelstate.FrontendKind]frontend.Runtime, error) {
