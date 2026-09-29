@@ -3,8 +3,7 @@
         "encore-local": {
             "args": [
                 "mcp",
-                "run",
-                "--app=3g278"
+                "run"
             ],
             "command": "encore"
         }

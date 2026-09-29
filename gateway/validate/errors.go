@@ -1,6 +1,6 @@
 package validate
 
-// Error is an OpenAI-shaped error for chat completions.
+// Error is an OpenAI-shaped validation failure.
 type Error struct {
 	Message string
 	Type    string

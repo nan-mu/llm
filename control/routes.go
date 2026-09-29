@@ -2,9 +2,11 @@ package control
 
 import (
 	"context"
+	"errors"
 	"strings"
 
 	"encore.dev/beta/errs"
+	"encore.dev/storage/sqldb"
 )
 
 // RouteInfo is one OpenAI-compatible route and its enablement.
@@ -14,12 +16,12 @@ type RouteInfo struct {
 	Enabled bool   `json:"enabled"`
 }
 
-// ListRoutesResponse is the public/private route listing.
+// ListRoutesResponse is the route listing. It has no secrets or socket paths.
 type ListRoutesResponse struct {
 	Routes []RouteInfo `json:"routes"`
 }
 
-// ListRoutes returns all api_routes rows (enabled flags only; no secrets).
+// ListRoutes returns every api_routes row.
 //
 //encore:api public method=GET path=/control/routes
 func (s *Service) ListRoutes(ctx context.Context) (*ListRoutesResponse, error) {
@@ -30,7 +32,7 @@ func (s *Service) ListRoutes(ctx context.Context) (*ListRoutesResponse, error) {
 	return &ListRoutesResponse{Routes: routes}, nil
 }
 
-// ListEnabledRoutes returns only enabled routes for the gateway.
+// ListEnabledRoutes returns only enabled routes.
 //
 //encore:api private method=GET path=/control/routes/enabled
 func (s *Service) ListEnabledRoutes(ctx context.Context) (*ListRoutesResponse, error) {
@@ -47,13 +49,13 @@ func (s *Service) ListEnabledRoutes(ctx context.Context) (*ListRoutesResponse, e
 	return &ListRoutesResponse{Routes: out}, nil
 }
 
-// RouteEnabledParams is the query for RouteEnabled.
+// RouteEnabledParams selects one (route, purpose) pair.
 type RouteEnabledParams struct {
 	Route   string `query:"route"`
 	Purpose string `query:"purpose"`
 }
 
-// RouteEnabledResponse reports whether one (route, purpose) pair is enabled.
+// RouteEnabledResponse reports whether that pair is enabled.
 type RouteEnabledResponse struct {
 	Route   string `json:"route"`
 	Purpose string `json:"purpose"`
@@ -61,9 +63,13 @@ type RouteEnabledResponse struct {
 }
 
 // RouteEnabled reports whether a single (route, purpose) row is enabled.
+// Gateway must use this (or ListEnabledRoutes) instead of scanning models.
 //
 //encore:api private method=GET path=/control/routes/check
 func (s *Service) RouteEnabled(ctx context.Context, p *RouteEnabledParams) (*RouteEnabledResponse, error) {
+	if p == nil {
+		return nil, &errs.Error{Code: errs.InvalidArgument, Message: "route required"}
+	}
 	route := strings.TrimSpace(p.Route)
 	purpose := strings.TrimSpace(p.Purpose)
 	if route == "" {
@@ -97,6 +103,9 @@ func listAPIRoutes(ctx context.Context) ([]RouteInfo, error) {
 		}
 		out = append(out, r)
 	}
+	if out == nil {
+		out = []RouteInfo{}
+	}
 	return out, rows.Err()
 }
 
@@ -105,50 +114,24 @@ func isRouteEnabled(ctx context.Context, route, purpose string) (bool, error) {
 	err := db.QueryRow(ctx, `
 		SELECT enabled FROM api_routes WHERE route = $1 AND purpose = $2
 	`, route, purpose).Scan(&enabled)
+	if errors.Is(err, sqldb.ErrNoRows) {
+		return false, nil
+	}
 	if err != nil {
 		return false, err
 	}
 	return enabled, nil
 }
 
-// refreshRouteEnablement sets each api_routes.enabled from whether any
-// model with that purpose is observed_state = loaded.
+// refreshRouteEnablement sets enabled from whether any model with that purpose is loaded.
 func refreshRouteEnablement(ctx context.Context) error {
-	rows, err := db.Query(ctx, `SELECT route, purpose FROM api_routes`)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	type key struct{ route, purpose string }
-	var keys []key
-	for rows.Next() {
-		var k key
-		if err := rows.Scan(&k.route, &k.purpose); err != nil {
-			return err
-		}
-		keys = append(keys, k)
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	for _, k := range keys {
-		var n int
-		err := db.QueryRow(ctx, `
-			SELECT COUNT(*) FROM models
-			WHERE purpose = $1 AND observed_state = 'loaded'
-		`, k.purpose).Scan(&n)
-		if err != nil {
-			return err
-		}
-		enabled := n > 0
-		_, err = db.Exec(ctx, `
-			UPDATE api_routes
-			SET enabled = $1, updated_at = NOW()
-			WHERE route = $2 AND purpose = $3 AND enabled IS DISTINCT FROM $1
-		`, enabled, k.route, k.purpose)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+	_, err := db.Exec(ctx, `
+		UPDATE api_routes ar
+		SET enabled = EXISTS (
+			SELECT 1 FROM models m
+			WHERE m.purpose = ar.purpose AND m.observed_state = 'loaded'
+		),
+		updated_at = NOW()
+	`)
+	return err
 }

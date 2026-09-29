@@ -1,200 +1,51 @@
-// Package mlxlm supervises one mlx-lm Python OS process per loaded model.
-// This package is not an Encore service.
+// Package mlxlm is the JSON-over-UDS frontend for TranslateGemma.
+// The worker binary is unix/mlx_lm/bin/mlx_lm_server. This package does not spawn it.
 package mlxlm
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 
 	"encore.app/frontend"
-	"encore.app/frontend/internal/proc"
-	"encore.app/frontend/internal/supervisor"
+	"encore.app/internal/approot"
+	"encore.app/internal/modelstate"
 )
 
-var secrets struct {
-	MlxlmAPIKey string
-}
+// BinaryRel is the worker path relative to the app root.
+const BinaryRel = "unix/mlx_lm/bin/mlx_lm_server"
 
-var (
-	_ frontend.Runtime    = (*Runtime)(nil)
-	_ frontend.Inferencer = (*Runtime)(nil)
-)
+type runtime struct{}
 
-// Config is passed by tests or by control. Empty fields get defaults.
-type Config struct {
-	Bin       string
-	Cwd       string
-	ModelsDir string
-	APIKey    string
-	ExtraEnv  []string
-}
+// New returns the mlxlm runtime.
+func New() frontend.Runtime { return runtime{} }
 
-// Runtime is the mlxlm frontend (thin wrapper over supervisor).
-type Runtime struct {
-	sup *supervisor.Supervisor
-	cfg Config
-}
+func (runtime) Kind() modelstate.FrontendKind { return modelstate.FrontendMlxlm }
 
-// New builds a runtime from Encore secrets and default cwd unix/mlxlm.
-func New() (*Runtime, error) {
-	return NewWithConfig(Config{})
-}
-
-// NewWithConfig builds a runtime. Used by tests to inject a fake binary.
-func NewWithConfig(cfg Config) (*Runtime, error) {
-	cfg, err := applyDefaults(cfg)
+func (runtime) Start(context.Context) (modelstate.FrontendState, error) {
+	root, err := approot.Root()
 	if err != nil {
-		return nil, err
+		return modelstate.FrontendStopped, err
 	}
-	if err := os.MkdirAll(cfg.Cwd, 0o755); err != nil {
-		return nil, err
+	bin := filepath.Join(root, filepath.FromSlash(BinaryRel))
+	if _, err := os.Stat(bin); err != nil {
+		return modelstate.FrontendStopped, fmt.Errorf("worker binary not present: %s", BinaryRel)
 	}
-	if err := os.MkdirAll(cfg.ModelsDir, 0o755); err != nil {
-		return nil, err
-	}
-	return &Runtime{
-		sup: supervisor.New("mlxlm"),
-		cfg: cfg,
-	}, nil
+	return modelstate.FrontendStopped, errors.New("worker binary present but this tree does not spawn mlxlm")
 }
 
-func (r *Runtime) Start(ctx context.Context) error {
-	return r.sup.Start(ctx)
+func (runtime) Stop(context.Context) error { return nil }
+
+func (runtime) Load(context.Context, string, string) error {
+	return errors.New("model load is not available in this tree")
 }
 
-func (r *Runtime) Stop(ctx context.Context) error {
-	return r.sup.Stop(ctx)
-}
+func (runtime) Unload(context.Context, string) error { return nil }
 
-func (r *Runtime) Ready(ctx context.Context) error {
-	return r.sup.Ready(ctx)
-}
+func (runtime) Ready(context.Context) error { return modelstate.ErrFrontendNotReady }
 
-func (r *Runtime) Load(ctx context.Context, id string) error {
-	modelPath := filepath.Join(r.cfg.ModelsDir, id)
-	sock := filepath.Join(r.cfg.Cwd, id+".sock")
-	return r.sup.Load(ctx, id, supervisor.SpawnSpec{
-		Bin:          r.cfg.Bin,
-		Args:         mlxlmArgs(modelPath, sock, r.cfg.APIKey),
-		Cwd:          r.cfg.Cwd,
-		SocketPath:   sock,
-		ExtraEnv:     r.cfg.ExtraEnv,
-		APIKey:       r.cfg.APIKey,
-		Path:         modelPath,
-		JSONProtocol: true,
-	})
-}
-
-func (r *Runtime) Unload(ctx context.Context, id string) error {
-	return r.sup.Unload(ctx, id)
-}
-
-func (r *Runtime) Get(ctx context.Context, id string) (frontend.Model, error) {
-	return r.sup.Get(ctx, id)
-}
-
-func (r *Runtime) List(ctx context.Context) ([]frontend.Model, error) {
-	return r.sup.List(ctx)
-}
-
-func (r *Runtime) EnsureReady(ctx context.Context) error {
-	return r.sup.EnsureReady(ctx)
-}
-
-func (r *Runtime) EnsureLoaded(ctx context.Context, id string) error {
-	if err := r.EnsureReady(ctx); err != nil {
-		return err
-	}
-	return r.Load(ctx, id)
-}
-
-func (r *Runtime) ModelPID(ctx context.Context, id string) (int, error) {
-	if err := r.Ready(ctx); err != nil {
-		return 0, err
-	}
-	pid, ok := r.sup.PID(id)
-	if !ok {
-		return 0, &frontend.Error{Code: frontend.CodeNotFound, Message: "model not found"}
-	}
-	return pid, nil
-}
-
-func (r *Runtime) BackendPIDs(ctx context.Context) ([]int, error) {
-	if err := r.Ready(ctx); err != nil {
-		return nil, nil
-	}
-	return r.sup.PIDs(), nil
-}
-
-// SetWorkerExitHandler registers a callback for unexpected worker process death.
-// exitCode is the child process exit status (-1 if unknown).
-func (r *Runtime) SetWorkerExitHandler(fn func(id string, exitCode int)) {
-	r.sup.SetExitHandler(fn)
-}
-
-func applyDefaults(cfg Config) (Config, error) {
-	needRoot := cfg.Cwd == "" || cfg.ModelsDir == "" || cfg.Bin == ""
-	var root string
-	if needRoot {
-		var err error
-		root, err = proc.AppRoot()
-		if err != nil {
-			return cfg, err
-		}
-	}
-	if cfg.Bin == "" {
-		cfg.Bin = envOr("MLXLM_BIN", defaultBin(root))
-	}
-	if cfg.Cwd == "" {
-		cfg.Cwd = filepath.Join(root, "frontend", "mlxlm")
-	}
-	if cfg.ModelsDir == "" {
-		cfg.ModelsDir = envOr("MLXLM_MODELS_DIR", filepath.Join(root, "models"))
-	}
-	if cfg.APIKey == "" {
-		cfg.APIKey = secrets.MlxlmAPIKey
-	}
-	if cfg.APIKey == "" {
-		cfg.APIKey = strings.TrimSpace(os.Getenv("MLXLM_API_KEY"))
-	}
-	var err error
-	cfg.Cwd, err = filepath.Abs(cfg.Cwd)
-	if err != nil {
-		return cfg, err
-	}
-	cfg.ModelsDir, err = filepath.Abs(cfg.ModelsDir)
-	if err != nil {
-		return cfg, err
-	}
-	return cfg, nil
-}
-
-func defaultBin(root string) string {
-	wrapper := filepath.Join(root, "unix", "mlx_lm", "bin", "mlx_lm_server")
-	if _, err := os.Stat(wrapper); err == nil {
-		return wrapper
-	}
-	return "mlx_lm_server"
-}
-
-func mlxlmArgs(modelPath, host, apiKey string) []string {
-	args := []string{
-		"--model-path", modelPath,
-		"--host", host,
-		"--parent-pid", strconv.Itoa(os.Getpid()),
-	}
-	if apiKey != "" {
-		args = append(args, "--api-key", apiKey)
-	}
-	return args
-}
-
-func envOr(key, fallback string) string {
-	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
-		return v
-	}
-	return fallback
+func (runtime) Get(context.Context, string) (frontend.Live, error) {
+	return frontend.Live{}, errors.New("model not loaded")
 }

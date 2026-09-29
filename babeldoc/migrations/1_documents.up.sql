@@ -1,9 +1,9 @@
 CREATE TABLE documents (
-    id              CHAR(64) PRIMARY KEY,
+    id              TEXT PRIMARY KEY CHECK (id ~ '^[0-9a-f]{64}$'),
     status          TEXT NOT NULL CHECK (status IN ('pending', 'down', 'error')),
     source_pdf      BYTEA NOT NULL,
     dual_pdf        BYTEA,
-    dual_sha256     CHAR(64),
+    dual_sha256     TEXT,
     error_code      TEXT NOT NULL DEFAULT '',
     error_message   TEXT NOT NULL DEFAULT '',
     generation      BIGINT NOT NULL DEFAULT 1,

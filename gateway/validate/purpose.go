@@ -9,20 +9,23 @@ import (
 
 	"encore.app/control"
 	"encore.app/internal/modelstate"
+	"encore.dev/beta/errs"
 )
 
 const (
-	RouteChat         = "POST /v1/chat/completions"
+	// RouteChat is the catalog key for chat completions.
+	RouteChat = "POST /v1/chat/completions"
+	// RouteTranslations is the catalog key for structured translation.
 	RouteTranslations = "POST /v1/translations"
 )
 
-// Message is one chat message; content must be a JSON string for translation chat.
+// Message is one chat message. For purpose=translation, content is a JSON string.
 type Message struct {
 	Role    string          `json:"role"`
 	Content json.RawMessage `json:"content"`
 }
 
-// Request is the mutable chat body validated and rewritten by PurposeContract.
+// Request is the chat body after sampling defaults are applied.
 type Request struct {
 	Model             string    `json:"model"`
 	Messages          []Message `json:"messages"`
@@ -34,13 +37,14 @@ type Request struct {
 	Stream            bool      `json:"stream,omitempty"`
 }
 
-// Result is a successful PurposeContract outcome (translation chat only).
+// Result is a successful chat validation.
 type Result struct {
 	Purpose string
 }
 
-// PurposeContract validates chat completions for purpose=translation only.
-// structured_translation must use POST /v1/translations.
+// PurposeContract validates chat completions for purpose=translation.
+// Sampling semantics: omitted field uses the table default; a value above max is rejected; a value at or below max is kept.
+// structured_translation models are rejected with model_purpose_mismatch.
 func PurposeContract(ctx context.Context, req *Request) (*Result, *Error) {
 	if req == nil || strings.TrimSpace(req.Model) == "" {
 		return nil, invalid("model required", "")
@@ -55,7 +59,10 @@ func PurposeContract(ctx context.Context, req *Request) (*Result, *Error) {
 	catalogID := strings.TrimSpace(req.Model)
 	snap, err := control.GetSnapshot(ctx, catalogID)
 	if err != nil {
-		return nil, invalid("model not found", "model_not_found")
+		if errs.Code(err) == errs.NotFound {
+			return nil, invalid("model not found", "model_not_found")
+		}
+		return nil, server("catalog unavailable")
 	}
 	purpose := modelstate.Purpose(snap.Purpose)
 	if purpose != modelstate.PurposeTranslation {
@@ -77,20 +84,23 @@ func PurposeContract(ctx context.Context, req *Request) (*Result, *Error) {
 	if err != nil {
 		return nil, server("purpose contract unavailable")
 	}
-	if e := validateTranslation(req, contract); e != nil {
+	if e := applyTranslation(req, contract); e != nil {
 		return nil, e
 	}
 	return &Result{Purpose: string(purpose)}, nil
 }
 
-func validateTranslation(req *Request, c *control.PurposeTranslationContract) *Error {
+func applyTranslation(req *Request, c *control.PurposeTranslationContract) *Error {
 	for _, m := range req.Messages {
+		if !c.AllowMultimodalContent && !isJSONString(m.Content) {
+			return invalid("translation message content must be a string", "")
+		}
 		role := strings.TrimSpace(m.Role)
+		if role == "" {
+			return invalid("message role required", "")
+		}
 		if role == "system" && !c.AllowSystemRole {
 			return invalid("system role not allowed for translation", "")
-		}
-		if !isJSONString(m.Content) {
-			return invalid("translation message content must be a string", "")
 		}
 	}
 	if e := applyFloat(&req.Temperature, c.TemperatureDefault, c.TemperatureMax, "temperature"); e != nil {
@@ -119,26 +129,27 @@ func validateTranslation(req *Request, c *control.PurposeTranslationContract) *E
 	return nil
 }
 
-// LangOK reports whether code matches the structured purpose lang pattern.
-func LangOK(ctx context.Context, code string) *Error {
-	c, err := control.GetPurposeStructuredTranslation(ctx)
-	if err != nil {
+// CheckLang checks a language code against the structured-translation contract.
+func CheckLang(code string, c *control.PurposeStructuredTranslationContract, required bool) *Error {
+	if c == nil {
 		return server("purpose contract unavailable")
 	}
 	code = strings.TrimSpace(code)
 	if code == "" {
-		return invalid("language code required", "")
-	}
-	pat := strings.TrimSpace(c.LangCodePattern)
-	if pat == "" {
+		if required {
+			return invalid("language code required", "")
+		}
 		return nil
 	}
-	re, err := regexp.Compile(pat)
-	if err != nil {
-		return server("invalid lang_code_pattern in purpose contract")
-	}
-	if !re.MatchString(code) {
-		return invalid("language code format invalid", "")
+	pat := strings.TrimSpace(c.LangCodePattern)
+	if pat != "" {
+		re, err := regexp.Compile(pat)
+		if err != nil {
+			return server("invalid lang_code_pattern in purpose contract")
+		}
+		if !re.MatchString(code) {
+			return invalid("language code format invalid", "")
+		}
 	}
 	if len(c.SupportedLangCodes) > 0 {
 		ok := false

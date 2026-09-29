@@ -3,7 +3,6 @@ package gateway
 import (
 	"encoding/json"
 	"net/http"
-	"strings"
 
 	"encore.app/control"
 	"encore.dev/rlog"
@@ -13,7 +12,7 @@ const swaggerUIHTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8"/>
-  <title>API Docs</title>
+  <title>llm API</title>
   <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css"/>
 </head>
 <body>
@@ -31,329 +30,268 @@ const swaggerUIHTML = `<!DOCTYPE html>
 </html>
 `
 
-// Docs serves Swagger UI for the business (gateway) surface. Public; no auth.
+// Docs serves Swagger UI for the public HTTP surface. No auth in this slice.
 //
 //encore:api public raw method=GET path=/docs
-func (s *Service) Docs(w http.ResponseWriter, req *http.Request) {
+func Docs(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write([]byte(swaggerUIHTML))
 }
 
-// OpenAPI serves the OpenAPI 3 document for business routes. Public; no auth.
-// Does not document gRPC, management Load/Unload, sockets, or secrets.
+// OpenAPI serves the operator OpenAPI document for public routes.
+// It does not document Load/Unload, sockets, or secrets.
+// Private service APIs are in Encore's generated API schema on the local dashboard.
 //
 //encore:api public raw method=GET path=/openapi.json
-func (s *Service) OpenAPI(w http.ResponseWriter, req *http.Request) {
-	routes, err := control.ListRoutes(req.Context())
-	if err != nil {
-		rlog.Error("openapi list routes failed", "event", "gateway.openapi_failed", "err", err)
-		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
-		return
-	}
+func OpenAPI(w http.ResponseWriter, req *http.Request) {
 	chatEnabled := false
 	translationsEnabled := false
-	for _, r := range routes.Routes {
-		if r.Route == "POST /v1/chat/completions" && r.Purpose == "translation" && r.Enabled {
-			chatEnabled = true
-		}
-		if r.Route == "POST /v1/translations" && r.Purpose == "structured_translation" && r.Enabled {
-			translationsEnabled = true
+	routes, err := control.ListRoutes(req.Context())
+	if err != nil {
+		rlog.Error("openapi list routes failed", "err", err)
+	} else {
+		for _, r := range routes.Routes {
+			if r.Route == "POST /v1/chat/completions" && r.Purpose == "translation" && r.Enabled {
+				chatEnabled = true
+			}
+			if r.Route == "POST /v1/translations" && r.Purpose == "structured_translation" && r.Enabled {
+				translationsEnabled = true
+			}
 		}
 	}
-	doc := buildOpenAPI(chatEnabled, translationsEnabled)
 	w.Header().Set("Content-Type", "application/json")
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
-	if err := enc.Encode(doc); err != nil {
-		rlog.Error("openapi encode failed", "event", "gateway.openapi_encode_failed", "err", err)
+	if err := enc.Encode(buildOpenAPI(chatEnabled, translationsEnabled)); err != nil {
+		rlog.Error("openapi encode failed", "err", err)
 	}
 }
 
 func buildOpenAPI(chatEnabled, translationsEnabled bool) map[string]any {
-	chatDesc := "OpenAI-compatible chat completions for purpose=translation only (BabelDOC / HY-MT2). messages[].content is a string. Sampling: model, messages, temperature, top_p, max_tokens, stream. Defaults/max from purpose_translation."
+	chatDesc := "Chat completions for purpose=translation. messages[].content is a string. Sampling fields: temperature, top_p, max_tokens, stream. Defaults and maximums come from purpose_translation. structured_translation models return model_purpose_mismatch."
 	if !chatEnabled {
 		chatDesc = "disabled: no loaded translation model. " + chatDesc
 	}
-	trDesc := "Document structured translation (TranslateGemma / purpose=structured_translation). Request uses source_language, target_language, optional context/glossaries, and inputs[]. Response is object=translation.batch with translations[].output and input_tokens/output_tokens."
+	trDesc := "Structured translation for purpose=structured_translation. Response object is translation.batch. Sampling defaults are applied server-side from purpose_structured_translation."
 	if !translationsEnabled {
 		trDesc = "disabled: no loaded structured_translation model. " + trDesc
 	}
-
-	paths := map[string]any{
-		"/v1/chat/completions": map[string]any{
-			"post": map[string]any{
-				"operationId": "chatCompletions",
-				"summary":     "Chat Completions",
-				"description": chatDesc,
-				"deprecated":  !chatEnabled,
-				"requestBody": map[string]any{
-					"required": true,
-					"content": map[string]any{
-						"application/json": map[string]any{
-							"schema": map[string]any{
-								"type":     "object",
-								"required": []string{"model", "messages"},
-								"properties": map[string]any{
-									"model": map[string]any{
-										"type":        "string",
-										"description": "Catalog model id with purpose=translation (e.g. HY-MT2-7B-Q8_0)",
-									},
-									"messages": map[string]any{
-										"type": "array",
-										"items": map[string]any{
-											"type": "object",
-											"properties": map[string]any{
-												"role":    map[string]any{"type": "string"},
-												"content": map[string]any{"type": "string"},
-											},
-										},
-									},
-									"temperature": map[string]any{"type": "number"},
-									"top_p":       map[string]any{"type": "number"},
-									"max_tokens":  map[string]any{"type": "integer"},
-									"stream":      map[string]any{"type": "boolean"},
-								},
-							},
-							"examples": map[string]any{
-								"translation": map[string]any{
-									"summary": "BabelDOC / HY-MT2 (purpose=translation)",
-									"value": map[string]any{
-										"model": "HY-MT2-7B-Q8_0",
-										"messages": []any{
-											map[string]any{"role": "user", "content": "Hello"},
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-				"responses": map[string]any{
-					"200": map[string]any{
-						"description": "Chat completion. Assistant content is a string. usage uses OpenAI prompt_tokens / completion_tokens.",
-						"content": map[string]any{
-							"application/json": map[string]any{
-								"schema": map[string]any{
-									"type": "object",
-									"properties": map[string]any{
-										"choices": map[string]any{
-											"type": "array",
-											"items": map[string]any{
-												"type": "object",
-												"properties": map[string]any{
-													"message": map[string]any{
-														"type": "object",
-														"properties": map[string]any{
-															"role":    map[string]any{"type": "string"},
-															"content": map[string]any{"type": "string"},
-														},
-													},
-												},
-											},
-										},
-										"usage": map[string]any{
-											"type": "object",
-											"properties": map[string]any{
-												"prompt_tokens":     map[string]any{"type": "integer"},
-												"completion_tokens": map[string]any{"type": "integer"},
-												"total_tokens":      map[string]any{"type": "integer"},
-											},
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-		"/v1/translations": map[string]any{
-			"post": map[string]any{
-				"operationId": "translations",
-				"summary":     "Structured Translations",
-				"description": trDesc,
-				"deprecated":  !translationsEnabled,
-				"requestBody": map[string]any{
-					"required": true,
-					"content": map[string]any{
-						"application/json": map[string]any{
-							"schema": map[string]any{
-								"type":     "object",
-								"required": []string{"model", "source_language", "target_language", "inputs"},
-								"properties": map[string]any{
-									"model":            map[string]any{"type": "string"},
-									"source_language":  map[string]any{"type": "string"},
-									"target_language":  map[string]any{"type": "string"},
-									"context": map[string]any{
-										"type": "object",
-										"properties": map[string]any{
-											"document_title": map[string]any{"type": "string"},
-											"recent_title":   map[string]any{"type": "string"},
-										},
-									},
-									"glossaries": map[string]any{
-										"type": "array",
-										"items": map[string]any{"type": "object"},
-									},
-									"inputs": map[string]any{
-										"type": "array",
-										"items": map[string]any{
-											"type":     "object",
-											"required": []string{"id", "text"},
-											"properties": map[string]any{
-												"id":                map[string]any{"type": "integer"},
-												"text":              map[string]any{"type": "string"},
-												"layout_label":      map[string]any{"type": "string"},
-												"placeholder_hints": map[string]any{"type": "object"},
-											},
-										},
-									},
-								},
-							},
-							"examples": map[string]any{
-								"batch": map[string]any{
-									"summary": "Document batch (TranslateGemma)",
-									"value": map[string]any{
-										"model":           "translategemma-12b-it-6bit",
-										"source_language": "en",
-										"target_language": "zh",
-										"context": map[string]any{
-											"document_title": "Paper",
-											"recent_title":   "1 Introduction",
-										},
-										"inputs": []any{
-											map[string]any{
-												"id":   0,
-												"text": "We prove that the <style id='1'>verifier</style> preserves {v1}.",
-											},
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-				"responses": map[string]any{
-					"200": map[string]any{
-						"description": "translation.batch — translations aligned by id; usage uses input_tokens / output_tokens.",
-						"content": map[string]any{
-							"application/json": map[string]any{
-								"schema": map[string]any{
-									"type": "object",
-									"properties": map[string]any{
-										"object": map[string]any{"type": "string", "enum": []string{"translation.batch"}},
-										"model":  map[string]any{"type": "string"},
-										"translations": map[string]any{
-											"type": "array",
-											"items": map[string]any{
-												"type": "object",
-												"properties": map[string]any{
-													"id":     map[string]any{"type": "integer"},
-													"output": map[string]any{"type": "string"},
-												},
-											},
-										},
-										"usage": map[string]any{
-											"type": "object",
-											"properties": map[string]any{
-												"input_tokens":  map[string]any{"type": "integer"},
-												"output_tokens": map[string]any{"type": "integer"},
-												"total_tokens":  map[string]any{"type": "integer"},
-											},
-										},
-									},
-								},
-								"examples": map[string]any{
-									"batch": map[string]any{
-										"value": map[string]any{
-											"object": "translation.batch",
-											"model":  "translategemma-12b-it-6bit",
-											"translations": []any{
-												map[string]any{
-													"id":     0,
-													"output": "我们证明<style id='1'>验证器</style>保持了 {v1}。",
-												},
-											},
-											"usage": map[string]any{
-												"input_tokens":  82,
-												"output_tokens": 31,
-												"total_tokens":  113,
-											},
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-		"/v1/models": map[string]any{
-			"get": map[string]any{
-				"operationId": "listModels",
-				"summary":     "List Models",
-				"description": "Loaded purpose=translation and structured_translation models (BabelDOC / HY-MT2 / TranslateGemma). ASR is omitted.",
-				"deprecated":  !chatEnabled,
-				"responses": map[string]any{
-					"200": map[string]any{
-						"description": "Model list",
-						"content": map[string]any{
-							"application/json": map[string]any{
-								"schema": map[string]any{"type": "object"},
-							},
-						},
-					},
-				},
-			},
-		},
-		"/control/routes": map[string]any{
-			"get": map[string]any{
-				"operationId": "listRoutes",
-				"summary":     "List API route enablement",
-				"description": "Read-only enablement flags for OpenAI-compatible (route, purpose) pairs, including POST /v1/translations.",
-				"responses": map[string]any{
-					"200": map[string]any{
-						"description": "Route list",
-						"content": map[string]any{
-							"application/json": map[string]any{
-								"schema": map[string]any{"type": "object"},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-
 	return map[string]any{
 		"openapi": "3.0.3",
 		"info": map[string]any{
-			"title":       "Local LLM Gateway",
+			"title":       "llm",
 			"version":     "0.1.0",
-			"description": "Business OpenAI-compatible HTTP on the gateway. Management APIs are not documented here.",
+			"description": "Public HTTP surface. BabelDOC worker execution is not wired. Private Encore APIs are omitted here.",
 		},
-		"servers": []map[string]any{
-			{"url": "/", "description": "Encore local HTTP"},
+		"paths": map[string]any{
+			"/health": map[string]any{
+				"get": op("Gateway health", "Returns ok when the gateway is up.", "", map[string]any{
+					"200": jsonResp("Health", "Gateway is up."),
+				}),
+			},
+			"/v1/models": map[string]any{
+				"get": op("List models", "Loaded translation and structured_translation models. ASR is omitted.", "", map[string]any{
+					"200": jsonResp("ModelList", "Model list."),
+				}),
+			},
+			"/v1/chat/completions": map[string]any{
+				"post": op("Chat completions", chatDesc, "ChatCompletionsRequest", map[string]any{
+					"200": jsonResp("ChatCompletionsResponse", "Completion or error envelope."),
+					"400": jsonResp("ChatCompletionsResponse", "Catalog or validation failure. X-Should-Retry: false."),
+					"404": jsonResp("ChatCompletionsResponse", "Unknown model."),
+				}),
+			},
+			"/v1/translations": map[string]any{
+				"post": op("Translations", trDesc, "TranslationsRequest", map[string]any{
+					"200": jsonResp("TranslationsResponse", "translation.batch or error envelope."),
+					"400": jsonResp("TranslationsResponse", "Catalog or validation failure. X-Should-Retry: false."),
+					"404": jsonResp("TranslationsResponse", "Unknown model."),
+				}),
+			},
+			"/v1/health": map[string]any{
+				"get": op("Zotero health", "Zotero facade health. No auth in this slice.", "", map[string]any{
+					"200": jsonResp("Health", "Facade is up."),
+				}),
+			},
+			"/v1/documents": map[string]any{
+				"get": op("List documents", "Full translation task list. Statuses: pending, down, error.", "", map[string]any{
+					"200": jsonResp("DocumentList", "Tasks."),
+				}),
+				"post": map[string]any{
+					"summary":     "Submit document",
+					"description": "Raw application/pdf body. Optional X-Document-SHA256 must be 64 lowercase hex and match the bytes. Task id is the SHA-256 of the PDF. Does not run a PDF worker.",
+					"requestBody": map[string]any{
+						"required": true,
+						"content": map[string]any{
+							"application/pdf": map[string]any{"schema": map[string]any{"type": "string", "format": "binary"}},
+						},
+					},
+					"responses": map[string]any{
+						"202": jsonResp("DocumentRef", "Task created (pending)."),
+						"200": jsonResp("DocumentRef", "Task already exists."),
+						"400": jsonResp("APIError", "Invalid PDF or hash."),
+					},
+				},
+			},
+			"/v1/documents/{hash}": map[string]any{
+				"delete": withParams(op("Delete document", "Idempotent task cleanup.", "", map[string]any{
+					"200": jsonResp("Ack", "Deleted or already absent."),
+					"400": jsonResp("APIError", "Hash is not 64 lowercase hex."),
+				}), hashParam()),
+			},
+			"/v1/documents/{hash}/files/dual": map[string]any{
+				"get": map[string]any{
+					"summary":     "Download dual PDF",
+					"description": "Bilingual PDF when status is down. Sets X-Artifact-SHA256.",
+					"parameters":  []any{hashParam()},
+					"responses": map[string]any{
+						"200": map[string]any{"description": "PDF bytes.", "content": map[string]any{"application/pdf": map[string]any{"schema": map[string]any{"type": "string", "format": "binary"}}}},
+						"404": jsonResp("APIError", "Unknown task."),
+						"409": jsonResp("APIError", "Task is not down."),
+					},
+				},
+			},
+			"/v1/documents/{hash}/retry": map[string]any{
+				"post": withParams(op("Retry document", "Re-queues an error task. pending and down are idempotent. Does not run a PDF worker.", "", map[string]any{
+					"202": jsonResp("DocumentRef", "Re-queued."),
+					"200": jsonResp("DocumentRef", "Already pending or down."),
+					"404": jsonResp("APIError", "Unknown task."),
+				}), hashParam()),
+			},
+			"/control/health": map[string]any{
+				"get": op("Control health", "Control plane and catalog database are up.", "", map[string]any{
+					"200": jsonResp("Health", "Control is up."),
+				}),
+			},
+			"/control/routes": map[string]any{
+				"get": op("List routes", "OpenAI route enablement. Enabled is true only when a model of that purpose is observed loaded.", "", map[string]any{
+					"200": jsonResp("RouteList", "Route table."),
+				}),
+			},
 		},
-		"paths": paths,
+		"components": map[string]any{
+			"schemas": map[string]any{
+				"Health":      map[string]any{"type": "object", "properties": map[string]any{"ok": map[string]any{"type": "boolean"}}},
+				"ChatMessage": map[string]any{"type": "object", "required": []string{"role", "content"}, "properties": map[string]any{"role": map[string]any{"type": "string"}, "content": map[string]any{"type": "string"}}},
+				"ChatCompletionsRequest": map[string]any{"type": "object", "required": []string{"model", "messages"}, "properties": map[string]any{
+					"model":       map[string]any{"type": "string", "description": "Catalog id."},
+					"messages":    map[string]any{"type": "array", "items": map[string]any{"$ref": "#/components/schemas/ChatMessage"}},
+					"temperature": map[string]any{"type": "number"},
+					"top_p":       map[string]any{"type": "number"},
+					"max_tokens":  map[string]any{"type": "integer"},
+					"stream":      map[string]any{"type": "boolean"},
+				}},
+				"OpenAIError": map[string]any{"type": "object", "properties": map[string]any{
+					"message": map[string]any{"type": "string"},
+					"type":    map[string]any{"type": "string"},
+					"code":    map[string]any{"type": "string"},
+				}},
+				"ChatCompletionsResponse": map[string]any{"type": "object", "properties": map[string]any{
+					"id":      map[string]any{"type": "string"},
+					"object":  map[string]any{"type": "string"},
+					"created": map[string]any{"type": "integer"},
+					"model":   map[string]any{"type": "string"},
+					"choices": map[string]any{"type": "array", "items": map[string]any{"type": "object"}},
+					"usage":   map[string]any{"type": "object"},
+					"error":   map[string]any{"$ref": "#/components/schemas/OpenAIError"},
+				}},
+				"TranslationsRequest": map[string]any{"type": "object", "required": []string{"model", "source_language", "target_language", "inputs"}, "properties": map[string]any{
+					"model":           map[string]any{"type": "string"},
+					"source_language": map[string]any{"type": "string"},
+					"target_language": map[string]any{"type": "string"},
+					"context":         map[string]any{"type": "object"},
+					"glossaries":      map[string]any{"type": "array", "items": map[string]any{"type": "object"}},
+					"inputs": map[string]any{"type": "array", "items": map[string]any{"type": "object", "required": []string{"id", "text"}, "properties": map[string]any{
+						"id":                map[string]any{"type": "integer"},
+						"text":              map[string]any{"type": "string"},
+						"layout_label":      map[string]any{"type": "string"},
+						"placeholder_hints": map[string]any{"type": "object"},
+					}}},
+				}},
+				"TranslationsResponse": map[string]any{"type": "object", "properties": map[string]any{
+					"object": map[string]any{"type": "string", "example": "translation.batch"},
+					"model":  map[string]any{"type": "string"},
+					"translations": map[string]any{"type": "array", "items": map[string]any{"type": "object", "properties": map[string]any{
+						"id":     map[string]any{"type": "integer"},
+						"output": map[string]any{"type": "string"},
+					}}},
+					"usage": map[string]any{"type": "object", "properties": map[string]any{
+						"input_tokens":  map[string]any{"type": "integer"},
+						"output_tokens": map[string]any{"type": "integer"},
+						"total_tokens":  map[string]any{"type": "integer"},
+					}},
+					"error": map[string]any{"$ref": "#/components/schemas/OpenAIError"},
+				}},
+				"ModelList": map[string]any{"type": "object", "properties": map[string]any{
+					"object": map[string]any{"type": "string"},
+					"data":   map[string]any{"type": "array", "items": map[string]any{"type": "object"}},
+				}},
+				"DocumentRef": map[string]any{"type": "object", "properties": map[string]any{
+					"id":     map[string]any{"type": "string"},
+					"status": map[string]any{"type": "string", "enum": []string{"pending", "down", "error"}},
+				}},
+				"DocumentList": map[string]any{"type": "object", "properties": map[string]any{
+					"documents": map[string]any{"type": "array", "items": map[string]any{"$ref": "#/components/schemas/DocumentRef"}},
+				}},
+				"Ack": map[string]any{"type": "object", "properties": map[string]any{"ack": map[string]any{"type": "boolean"}}},
+				"APIError": map[string]any{"type": "object", "properties": map[string]any{
+					"error": map[string]any{"type": "object", "properties": map[string]any{
+						"code":    map[string]any{"type": "string"},
+						"message": map[string]any{"type": "string"},
+					}},
+				}},
+				"RouteList": map[string]any{"type": "object", "properties": map[string]any{
+					"routes": map[string]any{"type": "array", "items": map[string]any{"type": "object", "properties": map[string]any{
+						"route":   map[string]any{"type": "string"},
+						"purpose": map[string]any{"type": "string"},
+						"enabled": map[string]any{"type": "boolean"},
+					}}},
+				}},
+			},
+		},
 	}
 }
 
-func openAPIContainsForbidden(raw []byte) bool {
-	s := strings.ToLower(string(raw))
-	forbidden := []string{
-		"grpc",
-		":9000",
-		"loadmodel",
-		"unloadmodel",
-		"protobuf",
-		".sock",
-		"secret",
+func op(summary, description, requestSchema string, responses map[string]any) map[string]any {
+	out := map[string]any{
+		"summary":     summary,
+		"description": description,
+		"responses":   responses,
 	}
-	for _, f := range forbidden {
-		if strings.Contains(s, f) {
-			return true
+	if requestSchema != "" {
+		out["requestBody"] = map[string]any{
+			"required": true,
+			"content": map[string]any{
+				"application/json": map[string]any{
+					"schema": map[string]any{"$ref": "#/components/schemas/" + requestSchema},
+				},
+			},
 		}
 	}
-	return false
+	return out
+}
+
+func withParams(op map[string]any, params ...any) map[string]any {
+	op["parameters"] = params
+	return op
+}
+
+func hashParam() map[string]any {
+	return map[string]any{
+		"name":     "hash",
+		"in":       "path",
+		"required": true,
+		"schema":   map[string]any{"type": "string", "pattern": "^[0-9a-f]{64}$"},
+	}
+}
+
+func jsonResp(schema, description string) map[string]any {
+	return map[string]any{
+		"description": description,
+		"content": map[string]any{
+			"application/json": map[string]any{
+				"schema": map[string]any{"$ref": "#/components/schemas/" + schema},
+			},
+		},
+	}
 }

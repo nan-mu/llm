@@ -1,3 +1,5 @@
+// Package modelstate is the residency contract between control and gateway.
+// Control writes catalog state. Gateway only reads snapshots through control APIs.
 package modelstate
 
 import (
@@ -6,11 +8,11 @@ import (
 	"strings"
 )
 
-// ErrFrontendNotReady is returned when a model Load is attempted before the Unix frontend is READY.
+// ErrFrontendNotReady is returned when a model load is attempted before the frontend is READY.
 var ErrFrontendNotReady = errors.New("frontend is not ready")
 
 // CanLoad reports whether catalog policy allows loading a model on this frontend.
-// unix must not call this; control applies it before Runtime.Load.
+// Workers do not implement this rule. Control applies it before Runtime.Load.
 func CanLoad(frontend FrontendState) error {
 	if frontend != FrontendReady {
 		return ErrFrontendNotReady
@@ -29,13 +31,13 @@ const (
 	ModelFailed    ModelState = "failed"
 )
 
-// FrontendState is the llama / mlxcel / mlxlm process behind a Unix socket.
+// FrontendState is the process behind a Unix frontend.
 type FrontendState string
 
 const (
 	FrontendStopped  FrontendState = "stopped"
 	FrontendStarting FrontendState = "starting"
-	FrontendLoading  FrontendState = "loading" // process up; model weights still loading
+	FrontendLoading  FrontendState = "loading"
 	FrontendReady    FrontendState = "ready"
 	FrontendStopping FrontendState = "stopping"
 	FrontendFailed   FrontendState = "failed"
@@ -50,16 +52,9 @@ const (
 	FrontendMlxlm  FrontendKind = "mlxlm"
 )
 
-// AllFrontends is the catalog order of Unix frontends. Register a new backend
-// here, in the frontends table, and in control's runtime map.
+// AllFrontends is the catalog order of Unix frontends.
 func AllFrontends() []FrontendKind {
 	return []FrontendKind{FrontendLlama, FrontendMlxcel, FrontendMlxlm}
-}
-
-// SupervisorFrontend reports whether kind uses one OS process per loaded model
-// (Start is a ready flag only; Load spawns the worker).
-func SupervisorFrontend(k FrontendKind) bool {
-	return k == FrontendLlama || k == FrontendMlxlm
 }
 
 // Purpose is which OpenAI route a model may serve.
@@ -71,26 +66,10 @@ const (
 	PurposeStructuredTranslation Purpose = "structured_translation"
 )
 
-// ModelSnapshot is the read-only view gateway may use.
-type ModelSnapshot struct {
-	ID         string
-	Frontend   FrontendKind
-	Path       string
-	Purpose    Purpose
-	NativeID   string
-	Desired    ModelState
-	Observed   ModelState
-	SocketPath string
-	LastError  string
-	PID        *int64
-	MemoryMB   *int64
-}
-
 const ggufExt = ".gguf"
 
 // FrontendFromPath infers the Unix frontend from a weights path.
-// Purpose must not be used: ASR and translation can run on either frontend.
-// Non-GGUF defaults to mlxlm; mlxcel is only via an explicit catalog row.
+// Non-GGUF defaults to mlxlm. mlxcel is only selected by an explicit catalog row.
 func FrontendFromPath(path string) FrontendKind {
 	if strings.HasSuffix(strings.ToLower(path), ggufExt) {
 		return FrontendLlama
@@ -98,8 +77,8 @@ func FrontendFromPath(path string) FrontendKind {
 	return FrontendMlxlm
 }
 
-// NativeID is the identifier passed to unix.Load/Unload.
-// GGUF: basename without a trailing .gguf (any case). MLX: the logical id.
+// NativeID is the identifier passed to a frontend for one catalog row.
+// GGUF paths use the basename without .gguf. Other paths use the catalog id.
 func NativeID(id, path string) string {
 	base := filepath.Base(path)
 	if strings.HasSuffix(strings.ToLower(base), ggufExt) {
@@ -118,29 +97,12 @@ func ValidFrontend(k FrontendKind) bool {
 	return false
 }
 
-// ValidPurpose reports whether p is a known catalog purpose.
+// ValidPurpose reports whether p is a known model purpose.
 func ValidPurpose(p Purpose) bool {
-	return p == PurposeASR || p == PurposeTranslation || p == PurposeStructuredTranslation
-}
-
-// ChatPurpose reports whether p may be served by POST /v1/chat/completions.
-func ChatPurpose(p Purpose) bool {
-	return p == PurposeTranslation || p == PurposeStructuredTranslation
-}
-
-// FrontendSnapshot is the read-only view of a Unix frontend.
-type FrontendSnapshot struct {
-	Kind       FrontendKind
-	SocketPath string
-	Observed   FrontendState
-	LastError  string
-	PIDs       []int64
-	MemoryMB   *int64
-}
-
-// Reader is the only modelstate API gateway should depend on.
-// control implements the writer side in the control package, not here.
-type Reader interface {
-	Get(id string) (ModelSnapshot, bool)
-	All() []ModelSnapshot
+	switch p {
+	case PurposeASR, PurposeTranslation, PurposeStructuredTranslation:
+		return true
+	default:
+		return false
+	}
 }

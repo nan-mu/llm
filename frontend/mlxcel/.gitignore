@@ -1,5 +1,0 @@
-*.sock
-*.pid
-store/**
-!store/
-!store/.gitkeep

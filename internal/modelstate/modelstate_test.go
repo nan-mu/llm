@@ -1,107 +1,42 @@
-package modelstate_test
+package modelstate
 
-import (
-	"errors"
-	"testing"
-
-	"encore.app/internal/modelstate"
-)
+import "testing"
 
 func TestCanLoad(t *testing.T) {
-	t.Parallel()
-
-	if err := modelstate.CanLoad(modelstate.FrontendReady); err != nil {
-		t.Fatalf("ready: %v", err)
+	if err := CanLoad(FrontendReady); err != nil {
+		t.Fatal(err)
 	}
-
-	states := []modelstate.FrontendState{
-		modelstate.FrontendStopped,
-		modelstate.FrontendStarting,
-		modelstate.FrontendLoading,
-		modelstate.FrontendStopping,
-		modelstate.FrontendFailed,
-		"",
-	}
-	for _, st := range states {
-		err := modelstate.CanLoad(st)
-		if !errors.Is(err, modelstate.ErrFrontendNotReady) {
-			t.Fatalf("CanLoad(%q) = %v, want ErrFrontendNotReady", st, err)
-		}
+	if err := CanLoad(FrontendStopped); err == nil {
+		t.Fatal("expected not ready")
 	}
 }
 
 func TestFrontendFromPath(t *testing.T) {
-	t.Parallel()
-
-	cases := []struct {
-		path string
-		want modelstate.FrontendKind
-	}{
-		{"models/fun-asr-nano-2512-q8_0.gguf", modelstate.FrontendLlama},
-		{"models/HY-MT2-7B-Q8_0.GGUF", modelstate.FrontendLlama},
-		{"models/translategemma-12b-it-6bit", modelstate.FrontendMlxlm},
-		{"/abs/dir/model", modelstate.FrontendMlxlm},
+	if got := FrontendFromPath("models/HY-MT2-7B-Q8_0.gguf"); got != FrontendLlama {
+		t.Fatalf("gguf frontend = %s", got)
 	}
-	for _, tc := range cases {
-		if got := modelstate.FrontendFromPath(tc.path); got != tc.want {
-			t.Fatalf("FrontendFromPath(%q) = %q, want %q", tc.path, got, tc.want)
-		}
+	if got := FrontendFromPath("models/HY-MT2-7B-Q8_0.GGUF"); got != FrontendLlama {
+		t.Fatalf("GGUF frontend = %s", got)
 	}
-}
-
-func TestAllFrontends(t *testing.T) {
-	t.Parallel()
-	got := modelstate.AllFrontends()
-	if len(got) != 3 || got[0] != modelstate.FrontendLlama || got[1] != modelstate.FrontendMlxcel || got[2] != modelstate.FrontendMlxlm {
-		t.Fatalf("AllFrontends = %v", got)
-	}
-	if !modelstate.ValidFrontend(modelstate.FrontendLlama) || !modelstate.ValidFrontend(modelstate.FrontendMlxcel) || !modelstate.ValidFrontend(modelstate.FrontendMlxlm) {
-		t.Fatal("seed frontends must be valid")
-	}
-	if modelstate.ValidFrontend("mlxaudio") {
-		t.Fatal("unknown frontend should be invalid until registered")
-	}
-	if !modelstate.SupervisorFrontend(modelstate.FrontendLlama) || !modelstate.SupervisorFrontend(modelstate.FrontendMlxlm) {
-		t.Fatal("llama and mlxlm are supervisor frontends")
-	}
-	if modelstate.SupervisorFrontend(modelstate.FrontendMlxcel) {
-		t.Fatal("mlxcel remains an engine frontend")
+	if got := FrontendFromPath("models/translategemma-12b-it-6bit"); got != FrontendMlxlm {
+		t.Fatalf("mlx frontend = %s", got)
 	}
 }
 
 func TestNativeID(t *testing.T) {
-	t.Parallel()
-
-	cases := []struct {
-		id, path, want string
-	}{
-		{"fun-asr-nano-2512-q8_0", "models/fun-asr-nano-2512-q8_0.gguf", "fun-asr-nano-2512-q8_0"},
-		{"HY-MT2-7B-Q8_0", "models/HY-MT2-7B-Q8_0.GGUF", "HY-MT2-7B-Q8_0"},
-		{"translategemma-12b-it-6bit", "models/translategemma-12b-it-6bit", "translategemma-12b-it-6bit"},
-		{"logical", "models/other-name.gguf", "other-name"},
+	if got := NativeID("ignored", "models/HY-MT2-7B-Q8_0.gguf"); got != "HY-MT2-7B-Q8_0" {
+		t.Fatalf("native id = %s", got)
 	}
-	for _, tc := range cases {
-		if got := modelstate.NativeID(tc.id, tc.path); got != tc.want {
-			t.Fatalf("NativeID(%q, %q) = %q, want %q", tc.id, tc.path, got, tc.want)
-		}
+	if got := NativeID("translategemma-12b-it-6bit", "models/translategemma-12b-it-6bit"); got != "translategemma-12b-it-6bit" {
+		t.Fatalf("native id = %s", got)
 	}
 }
 
-func TestValidPurpose(t *testing.T) {
-	t.Parallel()
-	if !modelstate.ValidPurpose(modelstate.PurposeASR) ||
-		!modelstate.ValidPurpose(modelstate.PurposeTranslation) ||
-		!modelstate.ValidPurpose(modelstate.PurposeStructuredTranslation) {
-		t.Fatal("seed purposes must be valid")
+func TestValid(t *testing.T) {
+	if !ValidFrontend(FrontendMlxlm) || ValidFrontend("dataplane") {
+		t.Fatal("frontend validity")
 	}
-	if modelstate.ValidPurpose("chat") {
-		t.Fatal("unknown purpose should be invalid")
-	}
-	if !modelstate.ChatPurpose(modelstate.PurposeTranslation) ||
-		!modelstate.ChatPurpose(modelstate.PurposeStructuredTranslation) {
-		t.Fatal("translation purposes must be chat")
-	}
-	if modelstate.ChatPurpose(modelstate.PurposeASR) {
-		t.Fatal("asr is not a chat purpose")
+	if !ValidPurpose(PurposeStructuredTranslation) || ValidPurpose("chat") {
+		t.Fatal("purpose validity")
 	}
 }

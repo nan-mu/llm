@@ -50,7 +50,13 @@ type PurposeStructuredTranslationContract struct {
 	ChatTemplateID        string   `json:"chat_template_id"`
 }
 
-// GetPurposeTranslation returns the translation purpose contract (singleton).
+// PurposeASRContract is the singleton row for purpose=asr.
+// Transcriptions are not implemented on the gateway yet.
+type PurposeASRContract struct {
+	Route string `json:"route"`
+}
+
+// GetPurposeTranslation returns the translation purpose contract.
 //
 //encore:api private method=GET path=/control/purpose/translation
 func (s *Service) GetPurposeTranslation(ctx context.Context) (*PurposeTranslationContract, error) {
@@ -82,7 +88,7 @@ func (s *Service) GetPurposeTranslation(ctx context.Context) (*PurposeTranslatio
 	return &c, nil
 }
 
-// GetPurposeStructuredTranslation returns the structured_translation contract (singleton).
+// GetPurposeStructuredTranslation returns the structured_translation contract.
 //
 //encore:api private method=GET path=/control/purpose/structured_translation
 func (s *Service) GetPurposeStructuredTranslation(ctx context.Context) (*PurposeStructuredTranslationContract, error) {
@@ -94,7 +100,7 @@ func (s *Service) GetPurposeStructuredTranslation(ctx context.Context) (*Purpose
 		       allow_type_text, allow_type_image,
 		       require_source_lang_code, require_target_lang_code,
 		       text_payload_field, image_payload_field, lang_code_pattern,
-		       supported_lang_codes,
+		       COALESCE(supported_lang_codes, '{}'),
 		       temperature_default, temperature_max,
 		       max_tokens_default, max_tokens_max,
 		       require_chat_template, chat_template_id
@@ -130,6 +136,21 @@ func (s *Service) GetPurposeStructuredTranslation(ctx context.Context) (*Purpose
 	if maxMax.Valid {
 		v := int(maxMax.Int64)
 		c.MaxTokensMax = &v
+	}
+	return &c, nil
+}
+
+// GetPurposeASR returns the ASR purpose contract.
+//
+//encore:api private method=GET path=/control/purpose/asr
+func (s *Service) GetPurposeASR(ctx context.Context) (*PurposeASRContract, error) {
+	var c PurposeASRContract
+	err := db.QueryRow(ctx, `SELECT route FROM purpose_asr WHERE id = 1`).Scan(&c.Route)
+	if errors.Is(err, sqldb.ErrNoRows) {
+		return nil, &errs.Error{Code: errs.NotFound, Message: "purpose_asr not seeded"}
+	}
+	if err != nil {
+		return nil, err
 	}
 	return &c, nil
 }

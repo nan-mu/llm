@@ -7,10 +7,10 @@ Stable architecture decisions for this Encore app. Do not treat this as an end-u
 Five Encore services:
 
 - `gateway` — sole **OpenAI-compatible** HTTP surface (`POST /v1/chat/completions`, `POST /v1/translations`, `GET /v1/models`, plus `/docs` and `/openapi.json`). Future: API tokens, sessions, usage.
-- `control` — model catalog, observed residency/frontend state, frontend management, localhost gRPC Load/Unload (gRPC to be removed later). Narrow public HTTP only: `/control/health`, `/control/routes`. Do not expose gRPC, Load/Unload, sockets, or secrets via those pages.
+- `control` — model catalog, observed residency/frontend state, frontend management. Load/Unload are in-process calls on the `frontend` library. This tree has no gRPC server. Narrow public HTTP only: `/control/health`, `/control/routes`. Do not expose Load/Unload, sockets, or secrets via those pages.
 - `unix` — private infer router only (`POST /unix/chat/:native_id`). Opaque prompt JSON in / out (`body` field for Encore S2S). **No middleware.** Dials mlxlm JSON-over-UDS. Does not Start/Load models.
 - `zotero` — public Zotero-plugin HTTP contract (`/v1/health`, `/v1/documents*`). **No auth** this slice (same as gateway). Delegates persistence/translation to `babeldoc`. No gRPC.
-- `babeldoc` — private PDF translation tasks: owns `babeldoc` Postgres DB (source/dual PDF as BYTEA), `/tmp` work dirs, `pixi run babeldoc` worker (serial, hours-long). Pub/Sub topic `babeldoc-translate`. Internal APIs under `/babeldoc/*` only.
+- `babeldoc` — private PDF translation tasks: owns the `babeldoc` Postgres DB (source/dual PDF as BYTEA) and Pub/Sub topic `babeldoc-translate`. Internal APIs under `/babeldoc/*` only. This tree does not start a `pixi` / `babeldoc` worker and does not create `/tmp` work dirs.
 
 Do not introduce services named `dataplane`, `identity`, `openai`, or `inference`.
 
@@ -22,6 +22,7 @@ Service-to-service calls use Encore `//encore:api private` (typed Go imports). D
 - Work files under `BABELDOC_WORK_ROOT` (default `/tmp/babeldoc-{hash}`); BabelDOC root default `/Users/nan/BabelDOC` via `BABELDOC_ROOT`.
 - Dual PDF only (`--no-mono`); BabelDOC config points structure-api at gateway `:4000/v1`.
 - Auth / OpenBao: deferred; next stage after this feature.
+- This tree keeps the task API, database, and `babeldoc-translate` topic. It does not shell out to `babeldoc` or `pixi`, and it does not vendor BabelDOC. A published event is acknowledged by a stub subscription.
 
 ## OpenAI routing (this slice)
 
@@ -34,7 +35,7 @@ Service-to-service calls use Encore `//encore:api private` (typed Go imports). D
 - Do **not** hardcode sampling or message-shape rules by model id; only by `purpose` → purpose_* row. Translations apply `purpose_structured_translation` defaults server-side (no client sampling fields).
 - Sampling semantics **A** (chat/translation): omitted field → table default; explicit value `> max` → 400; `≤ max` kept. Injected `top_k` / `repetition_penalty` are applied in validate middleware and forwarded toward the worker for llama; mlxlm path goes through `unix.Chat`.
 - Chat validation runs in `gateway/validate` via `openaiValidate` middleware (`tag:openai`) on **public** APIs only. Infer path is `unix.Chat` (no middleware).
-- Frontend matrix: `translation` → llama ChatProxy (temporary) or `unix.Chat` for mlxlm; `structured_translation` → `unix.Chat` only.
+- Frontend matrix: `translation` → `frontend/llama/proxy` HTTP-over-UDS (temporary; gateway does not import `frontend/llama` Start) or `unix.Chat` for mlxlm; `structured_translation` → `unix.Chat` only.
 - `GET /v1/models` lists loaded **translation** and **structured_translation** models (not ASR).
 - Gateway must not invent enablement by scanning `models`; use `control.RouteEnabled(route, purpose)` / `ListEnabledRoutes`.
 - This slice: **no auth** on chat, translations, `/docs`, or `/openapi.json`.
@@ -60,7 +61,7 @@ Load requires the frontend to be `READY`. That rule lives in `modelstate` (and c
 
 `encore run` / `initService` must not unconditionally Start workers. Construct runtimes, then **synchronously** reconcile `desired_state = 'loaded'` rows. No such rows means no processes.
 
-Default catalog residency: TranslateGemma (`translategemma-12b-it-6bit`) `desired=loaded`; others `unloaded`. Cold `encore run` reconciles that row and starts mlxlm.
+Default catalog residency: TranslateGemma (`translategemma-12b-it-6bit`) `desired=loaded`; others `unloaded`. Cold `encore run` reconciles that row. If `unix/mlx_lm/bin/mlx_lm_server` is missing, the model row becomes `observed_state=failed` with `last_error` set, and service init still succeeds. This tree does not spawn the worker even when the binary is present.
 
 Authoritative catalog lives in the **control database**, not `config/models.yaml`.
 
