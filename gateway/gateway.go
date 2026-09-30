@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"encore.app/control"
-	"encore.app/frontend/llama"
+	"encore.app/unix/llama"
 	"encore.app/gateway/validate"
 	"encore.app/internal/modelstate"
 	unixsvc "encore.app/unix"

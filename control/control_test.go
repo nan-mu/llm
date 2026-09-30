@@ -9,10 +9,10 @@ import (
 
 	controlv1 "encore.app/control/proto/controlv1"
 	"encore.app/internal/modelstate"
-	"encore.app/frontend"
-	"encore.app/frontend/llama"
-	"encore.app/frontend/mlxcel"
-	"encore.app/frontend/mlxlm"
+	"encore.app/unix"
+	"encore.app/unix/llama"
+	"encore.app/unix/mlxcel"
+	"encore.app/unix/mlxlm"
 	"encore.dev/beta/errs"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -43,11 +43,11 @@ func (e *testEnv) anyLlamaSock() bool {
 
 func newTestEnv(t *testing.T) *testEnv {
 	t.Helper()
-	bin, err := frontend.BuildFakeFrontend()
+	bin, err := unix.BuildFakeFrontend()
 	if err != nil {
 		t.Fatal(err)
 	}
-	fakemlxBin, err := frontend.BuildFakeMlxlm()
+	fakemlxBin, err := unix.BuildFakeMlxlm()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +98,7 @@ func newTestEnv(t *testing.T) *testEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc := &Service{runtimes: map[modelstate.FrontendKind]frontend.Runtime{
+	svc := &Service{runtimes: map[modelstate.FrontendKind]unix.Runtime{
 		modelstate.FrontendLlama:  llamaRt,
 		modelstate.FrontendMlxcel: mlxcelRt,
 		modelstate.FrontendMlxlm:  mlxlmRt,
@@ -632,18 +632,18 @@ func (f *failLoadRT) Start(context.Context) error { f.started = true; return nil
 func (f *failLoadRT) Stop(context.Context) error  { f.started = false; return nil }
 func (f *failLoadRT) Ready(context.Context) error {
 	if !f.started {
-		return frontend.ErrNotReady
+		return unix.ErrNotReady
 	}
 	return nil
 }
 func (f *failLoadRT) Load(context.Context, string) error {
-	return &frontend.Error{Code: frontend.CodeLoadFailed, Message: "weight not found"}
+	return &unix.Error{Code: unix.CodeLoadFailed, Message: "weight not found"}
 }
 func (f *failLoadRT) Unload(context.Context, string) error { return nil }
-func (f *failLoadRT) Get(context.Context, string) (frontend.Model, error) {
-	return frontend.Model{}, frontend.ErrNotReady
+func (f *failLoadRT) Get(context.Context, string) (unix.Model, error) {
+	return unix.Model{}, unix.ErrNotReady
 }
-func (f *failLoadRT) List(context.Context) ([]frontend.Model, error) { return nil, nil }
+func (f *failLoadRT) List(context.Context) ([]unix.Model, error) { return nil, nil }
 func (f *failLoadRT) EnsureReady(ctx context.Context) error      { return f.Start(ctx) }
 func (f *failLoadRT) EnsureLoaded(ctx context.Context, id string) error {
 	if err := f.EnsureReady(ctx); err != nil {
@@ -652,11 +652,11 @@ func (f *failLoadRT) EnsureLoaded(ctx context.Context, id string) error {
 	return f.Load(ctx, id)
 }
 func (f *failLoadRT) ModelPID(context.Context, string) (int, error) {
-	return 0, frontend.ErrNotReady
+	return 0, unix.ErrNotReady
 }
 func (f *failLoadRT) BackendPIDs(context.Context) ([]int, error) { return nil, nil }
 
-var _ frontend.Runtime = (*failLoadRT)(nil)
+var _ unix.Runtime = (*failLoadRT)(nil)
 
 func dialGRPC(t *testing.T, addr string) *grpc.ClientConn {
 	t.Helper()

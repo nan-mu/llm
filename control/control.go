@@ -10,10 +10,10 @@ import (
 	"time"
 
 	"encore.app/internal/modelstate"
-	"encore.app/frontend"
-	"encore.app/frontend/llama"
-	"encore.app/frontend/mlxcel"
-	"encore.app/frontend/mlxlm"
+	"encore.app/unix"
+	"encore.app/unix/llama"
+	"encore.app/unix/mlxcel"
+	"encore.app/unix/mlxlm"
 	"encore.dev"
 	"encore.dev/rlog"
 	"encore.dev/storage/sqldb"
@@ -33,7 +33,7 @@ const (
 
 //encore:service
 type Service struct {
-	runtimes map[modelstate.FrontendKind]frontend.Runtime
+	runtimes map[modelstate.FrontendKind]unix.Runtime
 	grpcSrv  *grpc.Server
 	grpcLn   net.Listener
 	cancel   context.CancelFunc
@@ -173,7 +173,7 @@ func (s *Service) wireWorkerExitHandlers() {
 	}
 }
 
-func (s *Service) unloadFrontend(ctx context.Context, rt frontend.Runtime) {
+func (s *Service) unloadFrontend(ctx context.Context, rt unix.Runtime) {
 	if err := rt.Ready(ctx); err != nil {
 		return
 	}
@@ -188,7 +188,7 @@ func (s *Service) unloadFrontend(ctx context.Context, rt frontend.Runtime) {
 	for _, m := range models {
 		switch m.State {
 		case modelstate.ModelLoaded, modelstate.ModelLoading, modelstate.ModelUnloading:
-			if err := rt.Unload(ctx, m.ID); err != nil && !frontend.Is(err, frontend.CodeNotFound) {
+			if err := rt.Unload(ctx, m.ID); err != nil && !unix.Is(err, unix.CodeNotFound) {
 				rlog.Error("shutdown unload failed",
 					"event", "control.shutdown_unload_failed",
 					"model_id", m.ID,
@@ -213,7 +213,7 @@ func (s *Service) Health(ctx context.Context) error {
 	return db.QueryRow(ctx, "SELECT 1").Scan(&n)
 }
 
-func (s *Service) runtime(kind modelstate.FrontendKind) frontend.Runtime {
+func (s *Service) runtime(kind modelstate.FrontendKind) unix.Runtime {
 	if s.runtimes == nil {
 		return nil
 	}
@@ -285,7 +285,7 @@ func isAddrInUse(err error) bool {
 	return false
 }
 
-func newRuntimes() (map[modelstate.FrontendKind]frontend.Runtime, error) {
+func newRuntimes() (map[modelstate.FrontendKind]unix.Runtime, error) {
 	if encore.Meta().Environment.Type == encore.EnvTest {
 		return newFakeuxRuntimes()
 	}
@@ -301,19 +301,19 @@ func newRuntimes() (map[modelstate.FrontendKind]frontend.Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
-	return map[modelstate.FrontendKind]frontend.Runtime{
+	return map[modelstate.FrontendKind]unix.Runtime{
 		modelstate.FrontendLlama:  llamaRt,
 		modelstate.FrontendMlxcel: mlxcelRt,
 		modelstate.FrontendMlxlm:  mlxlmRt,
 	}, nil
 }
 
-func newFakeuxRuntimes() (map[modelstate.FrontendKind]frontend.Runtime, error) {
-	bin, err := frontend.BuildFakeFrontend()
+func newFakeuxRuntimes() (map[modelstate.FrontendKind]unix.Runtime, error) {
+	bin, err := unix.BuildFakeFrontend()
 	if err != nil {
 		return nil, err
 	}
-	fakemlxBin, err := frontend.BuildFakeMlxlm()
+	fakemlxBin, err := unix.BuildFakeMlxlm()
 	if err != nil {
 		return nil, err
 	}
@@ -361,7 +361,7 @@ func newFakeuxRuntimes() (map[modelstate.FrontendKind]frontend.Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
-	return map[modelstate.FrontendKind]frontend.Runtime{
+	return map[modelstate.FrontendKind]unix.Runtime{
 		modelstate.FrontendLlama:  llamaRt,
 		modelstate.FrontendMlxcel: mlxcelRt,
 		modelstate.FrontendMlxlm:  mlxlmRt,

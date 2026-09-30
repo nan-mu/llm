@@ -22,7 +22,7 @@ func initService() (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
-	cwd := filepath.Join(root, "frontend", "mlxlm")
+	cwd := filepath.Join(root, "unix", "mlxlm")
 	if err := os.MkdirAll(cwd, 0o755); err != nil {
 		return nil, err
 	}

@@ -32,11 +32,11 @@ Service-to-service calls use Encore `//encore:api private` (typed Go imports). D
 - Hard catalog failures return OpenAI `{"error":{...}}` with **HTTP 4xx** and `X-Should-Retry: false`.
 - Mid-flight worker death: mlxlm serializes Metal `generate`; control applies `restart_policy`. Gateway waits/reposts up to ~3 minutes for chat recovery.
 
-## Frontends (library) + unix service
+## unix service + worker runtimes
 
-`frontend/` is a Go library (not an Encore service): `frontend/llama`, `frontend/mlxcel`, `frontend/mlxlm`. Each implements `frontend.Runtime`. control holds them in a `FrontendKind → Runtime` map. **Only `control` may Start / Stop / Load / Unload.**
+`unix` is the Encore infer service (`POST /unix/chat/:native_id`) and also hosts local worker runtimes as subpackages: `unix/llama`, `unix/mlxcel`, `unix/mlxlm`, plus `unix/internal` (proc/supervisor/httpx). Each engine implements `unix.Runtime`. control holds a `FrontendKind → Runtime` map. **Only `control` may Start / Stop / Load / Unload.**
 
-`unix` Encore service dials workers only. Sock cwd: `frontend/mlxlm/{native_id}.sock`. Worker binary: `unix/mlx_lm/bin/mlx_lm_server`.
+Sock cwd: `unix/mlxlm/{native_id}.sock`. Worker binary: `unix/mlx_lm/bin/mlx_lm_server`.
 
 - **mlxlm**: one-shot **JSON-over-UDS** (not HTTP). One connection = one JSON request + one JSON response. Health: `{"op":"health"}` → `{"ok":true}`. Chat response: `{"content":"...","usage":{...}}`.
 - **llama** (temporary until removed): HTTP-over-UDS; gateway still uses `llama.ChatProxy`.
@@ -62,7 +62,7 @@ Authoritative catalog lives in the **control database**, not `config/models.yaml
 
 ## Run and layout
 
-No `scripts/*.sh`. Frontend processes start through `frontend` when control calls Start.
+No `scripts/*.sh`. Worker processes start through `unix` runtimes when control calls Start.
 
 Prefer gateway `/docs` for operator-facing try-it. Do not restore the uptime template.
 
