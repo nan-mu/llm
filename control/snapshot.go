@@ -7,36 +7,48 @@ import (
 	"encore.dev/beta/errs"
 )
 
-// Snapshot is the catalog + optional live unix view of one model.
+// Snapshot 是目录中一个模型的快照（含可选的 live unix 观测）。
 type Snapshot struct {
-	ID         string  `json:"id"`
-	Frontend   string  `json:"frontend"`
-	Path       string  `json:"path"`
-	Purpose    string  `json:"purpose"`
-	NativeID   string  `json:"native_id"`
-	Desired    string  `json:"desired_state"`
-	Observed   string  `json:"observed_state"`
+	// 目录 ID（网关请求中的 model）
+	ID string `json:"id"`
+	// 所属 frontend：llama / mlxcel / mlxlm
+	Frontend string `json:"frontend"`
+	// 权重路径
+	Path string `json:"path"`
+	// 用途：translation / structured_translation / asr 等
+	Purpose string `json:"purpose"`
+	// Frontend 侧原生 ID
+	NativeID string `json:"native_id"`
+	// 期望驻留：loaded / unloaded
+	Desired string `json:"desired_state"`
+	// 观测驻留：unloaded / loading / loaded / unloading / failed
+	Observed string `json:"observed_state"`
+	// Unix socket（supervisor 型 frontend 通常省略）
 	SocketPath *string `json:"socket_path,omitempty"`
-	LastError  string  `json:"last_error,omitempty"`
-	PID        *int64  `json:"pid,omitempty"`
-	MemoryMB   *int64  `json:"memory_mb,omitempty"`
+	// 最近错误信息
+	LastError string `json:"last_error,omitempty"`
+	// 已加载时的工作进程 PID
+	PID *int64 `json:"pid,omitempty"`
+	// 已加载时的理论内存占用（MB）
+	MemoryMB *int64 `json:"memory_mb,omitempty"`
 }
 
-// GetSnapshot returns one catalog row. It does not start a frontend.
+// GetSnapshot 返回单个模型快照。只读，不启动 frontend。
 //
-//encore:api private method=GET path=/control/models/:id
+//encore:api public method=GET path=/control/models/:id
 func (s *Service) GetSnapshot(ctx context.Context, id string) (*Snapshot, error) {
 	return s.lookupSnapshot(ctx, id)
 }
 
-// ListSnapshotsResponse is the private catalog listing.
+// ListSnapshotsResponse 是模型目录列表响应。
 type ListSnapshotsResponse struct {
+	// 全部模型快照
 	Models []Snapshot `json:"models"`
 }
 
-// ListSnapshots returns catalog rows. It does not start a frontend.
+// ListSnapshots 列出目录中全部模型。只读，不启动 frontend。
 //
-//encore:api private method=GET path=/control/models
+//encore:api public method=GET path=/control/models
 func (s *Service) ListSnapshots(ctx context.Context) (*ListSnapshotsResponse, error) {
 	models, err := s.listSnapshots(ctx)
 	if err != nil {
@@ -84,19 +96,43 @@ func (s *Service) overlayLive(ctx context.Context, snap *Snapshot) {
 	snap.Observed = string(live.State)
 }
 
-func (s *Service) backendSnapshots(ctx context.Context) ([]BackendSnapshot, error) {
+// ListFrontendsResponse 是 frontend 列表响应。
+type ListFrontendsResponse struct {
+	// 全部 frontend 快照
+	Frontends []FrontendSnapshot `json:"frontends"`
+}
+
+// ListFrontends 列出全部 frontend（ready 以目录 observed_state 为准）。
+//
+//encore:api public method=GET path=/control/frontends
+func (s *Service) ListFrontends(ctx context.Context) (*ListFrontendsResponse, error) {
+	snaps, err := s.frontendSnapshots(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &ListFrontendsResponse{Frontends: snaps}, nil
+}
+
+// GetFrontend 按 kind 返回单个 frontend。
+//
+//encore:api public method=GET path=/control/frontends/:kind
+func (s *Service) GetFrontend(ctx context.Context, kind string) (*FrontendSnapshot, error) {
+	return s.lookupFrontend(ctx, kind)
+}
+
+func (s *Service) frontendSnapshots(ctx context.Context) ([]FrontendSnapshot, error) {
 	rows, err := listFrontends(ctx)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]BackendSnapshot, 0, len(rows))
+	out := make([]FrontendSnapshot, 0, len(rows))
 	for _, row := range rows {
-		out = append(out, s.backendSnapshot(ctx, row))
+		out = append(out, s.frontendSnapshot(ctx, row))
 	}
 	return out, nil
 }
 
-func (s *Service) lookupBackend(ctx context.Context, kind string) (*BackendSnapshot, error) {
+func (s *Service) lookupFrontend(ctx context.Context, kind string) (*FrontendSnapshot, error) {
 	k := modelstate.FrontendKind(kind)
 	if !modelstate.ValidFrontend(k) {
 		return nil, errFrontendNotFound()
@@ -105,15 +141,15 @@ func (s *Service) lookupBackend(ctx context.Context, kind string) (*BackendSnaps
 	if err != nil {
 		return nil, err
 	}
-	snap := s.backendSnapshot(ctx, *row)
+	snap := s.frontendSnapshot(ctx, *row)
 	return &snap, nil
 }
 
-func (s *Service) backendSnapshot(ctx context.Context, row frontendRow) BackendSnapshot {
+func (s *Service) frontendSnapshot(ctx context.Context, row frontendRow) FrontendSnapshot {
 	// ready follows catalog observed_state, not merely frontend.Ready (mlxlm is
 	// Ready after Start with zero workers — that must not look ready in Health).
 	ready := row.Observed == modelstate.FrontendReady
-	return BackendSnapshot{
+	return FrontendSnapshot{
 		Kind:       string(row.Kind),
 		SocketPath: row.SocketPath,
 		Observed:   string(row.Observed),
@@ -124,15 +160,23 @@ func (s *Service) backendSnapshot(ctx context.Context, row frontendRow) BackendS
 	}
 }
 
-// BackendSnapshot is one frontend as reported to gRPC (Ready is live, not Start).
-type BackendSnapshot struct {
-	Kind       string
-	SocketPath *string
-	Observed   string
-	LastError  string
-	Ready      bool
-	PIDs       []int64
-	MemoryMB   *int64
+// FrontendSnapshot 是管理面返回的单个 frontend 状态
+//（Ready 跟随目录 observed_state，而非仅表示进程已 Start）。
+type FrontendSnapshot struct {
+	// frontend 种类：llama / mlxcel / mlxlm
+	Kind string `json:"kind"`
+	// 共享 Unix socket（若有）
+	SocketPath *string `json:"socket_path,omitempty"`
+	// 观测状态：stopped / starting / loading / ready / stopping / failed
+	Observed string `json:"observed_state"`
+	// 最近错误
+	LastError string `json:"last_error,omitempty"`
+	// 是否就绪（目录 observed_state == ready）
+	Ready bool `json:"ready"`
+	// 相关进程 PID
+	PIDs []int64 `json:"pids,omitempty"`
+	// 采样内存（MB）
+	MemoryMB *int64 `json:"memory_mb,omitempty"`
 }
 
 func (row modelRow) snapshot() *Snapshot {

@@ -29,15 +29,15 @@ func TestTheoreticalMemoryOnLoadedGemma(t *testing.T) {
 	if snap.MemoryMB == nil || *snap.MemoryMB != 9560 {
 		t.Fatalf("memory_mb = %v, want 9560", snap.MemoryMB)
 	}
-	be, err := env.svc.lookupBackend(ctx, "mlxlm")
+	fe, err := env.svc.lookupFrontend(ctx, "mlxlm")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if be.SocketPath != nil {
-		t.Fatalf("backend socket_path should be nil")
+	if fe.SocketPath != nil {
+		t.Fatalf("frontend socket_path should be nil")
 	}
-	if len(be.PIDs) != 1 || be.PIDs[0] != *snap.PID {
-		t.Fatalf("backend pids = %v, model pid = %v", be.PIDs, snap.PID)
+	if len(fe.PIDs) != 1 || fe.PIDs[0] != *snap.PID {
+		t.Fatalf("frontend pids = %v, model pid = %v", fe.PIDs, snap.PID)
 	}
 }
 
@@ -61,12 +61,12 @@ func TestUnloadClearsModelPID(t *testing.T) {
 	if snap.MemoryMB != nil {
 		t.Fatalf("memory_mb should be nil when unloaded")
 	}
-	be, err := env.svc.lookupBackend(ctx, "mlxlm")
+	fe, err := env.svc.lookupFrontend(ctx, "mlxlm")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(be.PIDs) != 0 {
-		t.Fatalf("backend pids = %v", be.PIDs)
+	if len(fe.PIDs) != 0 {
+		t.Fatalf("frontend pids = %v", fe.PIDs)
 	}
 }
 
@@ -109,12 +109,12 @@ func TestSampleFrontendWritesMemory(t *testing.T) {
 	if err := env.svc.sampleFrontend(ctx, modelstate.FrontendMlxlm); err != nil {
 		t.Fatal(err)
 	}
-	be, err := env.svc.lookupBackend(ctx, "mlxlm")
+	fe, err := env.svc.lookupFrontend(ctx, "mlxlm")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if be.MemoryMB == nil || *be.MemoryMB != 4242 {
-		t.Fatalf("memory_mb = %v", be.MemoryMB)
+	if fe.MemoryMB == nil || *fe.MemoryMB != 4242 {
+		t.Fatalf("memory_mb = %v", fe.MemoryMB)
 	}
 }
 

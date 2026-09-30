@@ -7,17 +7,12 @@ import (
 	"testing"
 	"time"
 
-	controlv1 "encore.app/control/proto/controlv1"
 	"encore.app/internal/modelstate"
 	"encore.app/unix"
 	"encore.app/unix/llama"
 	"encore.app/unix/mlxcel"
 	"encore.app/unix/mlxlm"
 	"encore.dev/beta/errs"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/status"
 )
 
 const (
@@ -107,9 +102,6 @@ func newTestEnv(t *testing.T) *testEnv {
 	t.Cleanup(func() {
 		if svc.restarts != nil {
 			svc.restarts.cancelAll()
-		}
-		if svc.grpcSrv != nil {
-			svc.grpcSrv.Stop()
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -368,7 +360,7 @@ func TestAbortBootDrainsFrontends(t *testing.T) {
 	}
 }
 
-func TestGRPCLoadGemmaStartsMlxlm(t *testing.T) {
+func TestSetDesiredStateLoadGemmaStartsMlxlm(t *testing.T) {
 	env := newTestEnv(t)
 	ctx := env.ctx(t)
 	setDesired(t, ctx, idASR, idHY)
@@ -378,26 +370,20 @@ func TestGRPCLoadGemmaStartsMlxlm(t *testing.T) {
 	if sockExists(env.mlxlmSock) {
 		t.Fatal("mlxlm should be down before Load")
 	}
-	if err := env.svc.serveGRPC("127.0.0.1:0"); err != nil {
-		t.Fatal(err)
-	}
-	conn := dialGRPC(t, env.svc.grpcLn.Addr().String())
-	defer conn.Close()
-	client := controlv1.NewModelControlClient(conn)
 
-	got, err := client.LoadModel(ctx, &controlv1.LoadModelRequest{Id: idGemma})
+	got, err := env.svc.SetDesiredState(ctx, idGemma, &DesiredStateParams{State: string(modelstate.ModelLoaded)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.GetObservedState() != string(modelstate.ModelLoaded) {
-		t.Fatalf("gemma observed = %s", got.GetObservedState())
+	if got.Observed != string(modelstate.ModelLoaded) {
+		t.Fatalf("gemma observed = %s", got.Observed)
 	}
 	if !sockExists(env.mlxlmSock) {
 		t.Fatal("expected mlxlm model sock after Load Gemma")
 	}
 
-	_, err = client.GetModel(ctx, &controlv1.GetModelRequest{Id: "missing"})
-	if status.Code(err) != codes.NotFound {
+	_, err = env.svc.GetSnapshot(ctx, "missing")
+	if errs.Code(err) != errs.NotFound {
 		t.Fatalf("missing model: %v", err)
 	}
 }
@@ -568,35 +554,28 @@ func TestReconcileLoadFailureReturnsError(t *testing.T) {
 	}
 }
 
-func TestGRPCLoadFailureKeepsProcess(t *testing.T) {
+func TestSetDesiredStateLoadFailureKeepsProcess(t *testing.T) {
 	env := newTestEnv(t)
 	ctx := env.ctx(t)
 	env.svc.runtimes[modelstate.FrontendMlxlm] = &failLoadRT{}
 	setDesired(t, ctx)
-	if err := env.svc.serveGRPC("127.0.0.1:0"); err != nil {
-		t.Fatal(err)
-	}
-	conn := dialGRPC(t, env.svc.grpcLn.Addr().String())
-	defer conn.Close()
-	client := controlv1.NewModelControlClient(conn)
 
-	_, err := client.LoadModel(ctx, &controlv1.LoadModelRequest{Id: idGemma})
+	_, err := env.svc.SetDesiredState(ctx, idGemma, &DesiredStateParams{State: string(modelstate.ModelLoaded)})
 	if err == nil {
-		t.Fatal("LoadModel should return an error")
+		t.Fatal("SetDesiredState loaded should return an error")
 	}
-	got, err := client.GetModel(ctx, &controlv1.GetModelRequest{Id: idGemma})
+	got, err := env.svc.GetSnapshot(ctx, idGemma)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.GetObservedState() != string(modelstate.ModelFailed) {
-		t.Fatalf("observed = %s", got.GetObservedState())
+	if got.Observed != string(modelstate.ModelFailed) {
+		t.Fatalf("observed = %s", got.Observed)
 	}
-	if _, err := client.GetModel(ctx, &controlv1.GetModelRequest{Id: idGemma}); err != nil {
+	if _, err := env.svc.GetSnapshot(ctx, idGemma); err != nil {
 		t.Fatalf("process should stay up after Load failure: %v", err)
 	}
-	backends := controlv1.NewBackendControlClient(conn)
-	if _, err := backends.Health(ctx, &controlv1.HealthRequest{}); err != nil {
-		t.Fatalf("health after Load failure: %v", err)
+	if _, err := env.svc.ListFrontends(ctx); err != nil {
+		t.Fatalf("list frontends after Load failure: %v", err)
 	}
 }
 
@@ -657,24 +636,3 @@ func (f *failLoadRT) ModelPID(context.Context, string) (int, error) {
 func (f *failLoadRT) BackendPIDs(context.Context) ([]int, error) { return nil, nil }
 
 var _ unix.Runtime = (*failLoadRT)(nil)
-
-func dialGRPC(t *testing.T, addr string) *grpc.ClientConn {
-	t.Helper()
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		t.Fatal(err)
-	}
-	client := controlv1.NewBackendControlClient(conn)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	for {
-		_, err := client.Health(ctx, &controlv1.HealthRequest{})
-		if err == nil {
-			return conn
-		}
-		if ctx.Err() != nil {
-			t.Fatalf("grpc health: %v", err)
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-}

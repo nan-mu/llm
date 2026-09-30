@@ -7,12 +7,12 @@ Stable architecture decisions for this Encore app. Do not treat this as an end-u
 Three Encore services:
 
 - `gateway` — sole **OpenAI-compatible** HTTP surface (`POST /v1/chat/completions`, `POST /v1/translations`, `GET /v1/models`, plus `/docs` and `/openapi.json`). Future: API tokens, sessions, usage.
-- `control` — model catalog, observed residency/frontend state, frontend management, localhost gRPC Load/Unload (gRPC to be removed later). Narrow public HTTP only: `/control/health`, `/control/routes`. Do not expose gRPC, Load/Unload, sockets, or secrets via those pages.
+- `control` — model catalog, observed residency/frontend state, frontend management via public RESTful HTTP (`GET /control/models`, `PUT /control/models/:id/desired-state`, `POST /control/models/:id/reloads`, `GET /control/frontends`). Also `GET /control/health`, `GET /control/routes`. Auth on management APIs is next. Do not expose Load/Unload, sockets, or secrets via OpenAI `/docs` / `/openapi.json`.
 - `unix` — private infer router only (`POST /unix/chat/:native_id`). Opaque prompt JSON in / out (`body` field for Encore S2S). **No middleware.** Dials mlxlm JSON-over-UDS. Does not Start/Load models.
 
 Do not introduce services named `dataplane`, `identity`, `openai`, `inference`, `zotero`, or `babeldoc`. Clients that previously used dedicated Zotero/BabelDOC surfaces should call `POST /v1/translations` (structured) or `POST /v1/chat/completions` (string translation) instead.
 
-Service-to-service calls use Encore `//encore:api private` (typed Go imports). Do not add new gRPC for internal APIs.
+Service-to-service calls use Encore `//encore:api private` (typed Go imports). Do not add gRPC.
 
 ## OpenAI routing (this slice)
 

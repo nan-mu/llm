@@ -7,19 +7,23 @@ import (
 	"encore.dev/beta/errs"
 )
 
-// RouteInfo is one OpenAI-compatible route and its enablement.
+// RouteInfo 是一条 OpenAI 兼容路由及其启用状态。
 type RouteInfo struct {
-	Route   string `json:"route"`
+	// OpenAI 兼容路径，例如 /v1/chat/completions
+	Route string `json:"route"`
+	// 用途：translation / structured_translation / asr 等
 	Purpose string `json:"purpose"`
-	Enabled bool   `json:"enabled"`
+	// 是否对该 purpose 开放
+	Enabled bool `json:"enabled"`
 }
 
-// ListRoutesResponse is the public/private route listing.
+// ListRoutesResponse 是路由表列表响应。
 type ListRoutesResponse struct {
+	// 全部 api_routes 行
 	Routes []RouteInfo `json:"routes"`
 }
 
-// ListRoutes returns all api_routes rows (enabled flags only; no secrets).
+// ListRoutes 返回全部 api_routes（仅启用标志，不含密钥）。
 //
 //encore:api public method=GET path=/control/routes
 func (s *Service) ListRoutes(ctx context.Context) (*ListRoutesResponse, error) {
