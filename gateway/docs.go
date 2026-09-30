@@ -70,7 +70,7 @@ func (s *Service) OpenAPI(w http.ResponseWriter, req *http.Request) {
 }
 
 func buildOpenAPI(chatEnabled, translationsEnabled bool) map[string]any {
-	chatDesc := "OpenAI-compatible chat completions for purpose=translation only (BabelDOC / HY-MT2). messages[].content is a string. Sampling: model, messages, temperature, top_p, max_tokens, stream. Defaults/max from purpose_translation."
+	chatDesc := "OpenAI-compatible chat completions for purpose=translation only (e.g. HY-MT2). messages[].content is a string. Sampling: model, messages, temperature, top_p, max_tokens, stream. Defaults/max from purpose_translation."
 	if !chatEnabled {
 		chatDesc = "disabled: no loaded translation model. " + chatDesc
 	}
@@ -116,7 +116,7 @@ func buildOpenAPI(chatEnabled, translationsEnabled bool) map[string]any {
 							},
 							"examples": map[string]any{
 								"translation": map[string]any{
-									"summary": "BabelDOC / HY-MT2 (purpose=translation)",
+									"summary": "HY-MT2 (purpose=translation)",
 									"value": map[string]any{
 										"model": "HY-MT2-7B-Q8_0",
 										"messages": []any{
@@ -292,7 +292,7 @@ func buildOpenAPI(chatEnabled, translationsEnabled bool) map[string]any {
 			"get": map[string]any{
 				"operationId": "listModels",
 				"summary":     "List Models",
-				"description": "Loaded purpose=translation and structured_translation models (BabelDOC / HY-MT2 / TranslateGemma). ASR is omitted.",
+				"description": "Loaded purpose=translation and structured_translation models (e.g. HY-MT2 / TranslateGemma). ASR is omitted.",
 				"deprecated":  !chatEnabled,
 				"responses": map[string]any{
 					"200": map[string]any{

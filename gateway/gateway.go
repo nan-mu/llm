@@ -392,7 +392,7 @@ type ModelEntry struct {
 }
 
 // ListModels lists loaded translation and structured_translation models
-// (BabelDOC / HY-MT2 / TranslateGemma). ASR is omitted.
+// (e.g. HY-MT2 / TranslateGemma). ASR is omitted.
 //
 //encore:api public method=GET path=/v1/models
 func (s *Service) ListModels(ctx context.Context) (*ListModelsResponse, error) {
