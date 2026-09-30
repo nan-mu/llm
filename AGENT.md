@@ -4,11 +4,12 @@ Stable architecture decisions for this Encore app. Do not treat this as an end-u
 
 ## Services
 
-Three Encore services:
+Four Encore services:
 
 - `gateway` — sole **OpenAI-compatible** HTTP surface (`POST /v1/chat/completions`, `POST /v1/translations`, `GET /v1/models`, plus `/docs` and `/openapi.json`). Future: API tokens, sessions, usage.
 - `control` — model catalog, observed residency/frontend state, frontend management. Load/Unload are in-process calls on the `frontend` library. This tree has no gRPC server. Narrow public HTTP only: `/control/health`, `/control/routes`. Do not expose Load/Unload, sockets, or secrets via those pages.
 - `unix` — private infer router only (`POST /unix/chat/:native_id`). Opaque prompt JSON in / out (`body` field for Encore S2S). **No middleware.** Dials mlxlm JSON-over-UDS. Does not Start/Load models.
+- `bubblehub` — **Bubble Hub**. Public, no auth this slice: `GET /bubblehub` and `GET /bubblehub/health`. Not a BabelDOC or Zotero service.
 
 Zotero and BabelDOC do not belong in this app. The Zotero plugin HTTP contract, PDF task storage, and the BabelDOC worker live in a separate backend. Do not add those services, that database, or that Pub/Sub topic here.
 

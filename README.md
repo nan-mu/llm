@@ -22,5 +22,6 @@ Public checks:
 - `GET /control/health` — control
 - `GET /control/routes` — route enablement
 - `GET /docs` and `GET /openapi.json` — operator HTTP document
+- `GET /bubblehub/health` — Bubble Hub
 
 The default catalog row for TranslateGemma stays `desired=loaded`. If `unix/mlx_lm/bin/mlx_lm_server` is not on the machine, startup records that on the model row and keeps serving.
